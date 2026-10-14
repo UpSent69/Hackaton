@@ -41,7 +41,7 @@ type Role string
 
 const (
 	RoleAdmin  Role = "admin"
-	RoleViewer Role = "viewer"
+	RoleManager Role = "manager" // менеджер: видит все данные, но не меняет их
 )
 
 // ---------- Ошибки ----------

@@ -95,6 +95,8 @@
     transform: translateY(-1px);
     box-shadow: 0 4px 12px rgba(255,255,255,0.1);
   }
+  .nav-actions { display: flex; align-items: center; gap: 8px; }
+  a.nav-dashboard-btn { text-decoration: none; }
 
   /* ===== WAREHOUSE PAGE ===== */
   .warehouse-page {
@@ -344,6 +346,7 @@
   }
   .stock-bar.empty { background: rgba(255, 255, 255, 0.12); box-shadow: none; }
 </style>
+  <script src="motion.js"></script>
 </head>
 <body>
 
@@ -362,7 +365,7 @@
       <li><a href="app.html#/demo">Демо</a></li>
     </ul>
   </div>
-  <button class="nav-dashboard-btn" onclick="window.location.href='index.html'">Дашборд</button>
+  <div class="nav-actions" id="navActions"></div>
 </nav>
 
 <div class="warehouse-page">
@@ -564,25 +567,19 @@ async function loadServerData() {
   }
 }
 
-// Переход к форме входа не зависит от клиентского состояния сессии.
-function renderAuthButton() {
-  const anchor = document.querySelector('.nav-dashboard-btn');
-  if (!anchor || document.getElementById('navLoginButton')) return;
-  const button = document.createElement('button');
-  button.id = 'navLoginButton';
-  button.className = 'nav-dashboard-btn';
-  button.style.marginLeft = '8px';
-  button.textContent = 'Войти';
-  button.onclick = (event) => {
-    event.stopPropagation();
-    window.location.href = 'login.html';
-  };
-  anchor.after(button);
+// Кнопки шапки: «Администрирование» — только администраторам, «Выйти» — после входа,
+// «Войти» — только если сессии нет. Выход обрабатывает shared.js по атрибуту data-logout.
+function renderNavActions() {
+  const user = API.getUser();
+  const actions = document.getElementById('navActions');
+  actions.innerHTML =
+    (user && user.role === 'admin' ? '<a class="nav-dashboard-btn" href="app.html#/admin">Администрирование</a>' : '') +
+    (user ? '<button type="button" class="nav-dashboard-btn" data-logout>Выйти</button>' : '<a class="nav-dashboard-btn" href="login.html">Войти</a>');
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   renderWarehouse();
-  renderAuthButton();
+  renderNavActions();
   loadServerData();
 });
 </script>

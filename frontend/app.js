@@ -119,13 +119,15 @@
     const user = API.getUser()
     const links = NAV.map(([path, label, page]) => `<a href="${page || '#/' + path}"${path === current ? ' class="active"' : ''}>${label}</a>`).join('')
     document.getElementById('navLinks').innerHTML = links
+    const admin = isAdmin()
     document.getElementById('navActions').innerHTML =
       `<span class="nav-user" title="${escapeHtml(user?.email || '')}">${escapeHtml(user?.name || 'Сессия определяется сервером')}</span>
-       <a class="btn btn-line btn-sm${current === 'admin' ? ' active' : ''}" href="#/admin">Администрирование</a>
+       ${admin ? `<a class="btn btn-line btn-sm${current === 'admin' ? ' active' : ''}" href="#/admin">Администрирование</a>` : ''}
        <span class="label tag clock-chip" id="clockChip" hidden></span>
-       <a class="btn btn-solid btn-sm" href="login.html">Войти</a>
-       <button type="button" class="btn btn-line btn-sm" data-logout>Выйти</button>`
-    menu.innerHTML = links + '<div class="divider"></div><a href="#/admin">Администрирование</a><a href="login.html">Войти</a><a href="index.html" data-logout>Завершить сессию</a>'
+       ${user ? '<button type="button" class="btn btn-line btn-sm" data-logout>Выйти</button>' : '<a class="btn btn-solid btn-sm" href="login.html">Войти</a>'}`
+    menu.innerHTML = links + '<div class="divider"></div>' +
+      (admin ? '<a href="#/admin">Администрирование</a>' : '') +
+      (user ? '<a href="index.html" data-logout>Завершить сессию</a>' : '<a href="login.html">Войти</a>')
   }
 
   function setMenu(open) {
@@ -448,11 +450,11 @@
   /* ---------- Администрирование: кто может изменять данные ---------- */
 
   const roleBadge = (role) =>
-    `<span class="label status" style="--status-color:${role === 'admin' ? STATUS.ok.color : 'rgba(255,255,255,0.3)'}">${role === 'admin' ? 'Администратор' : 'Просмотр'}</span>`
+    `<span class="label status" style="--status-color:${role === 'admin' ? STATUS.ok.color : 'rgba(255,255,255,0.3)'}">${role === 'admin' ? 'Администратор' : 'Менеджер'}</span>`
 
   async function adminView() {
     view.innerHTML = `<main class="page">
-      ${pageHeader('Администрирование', 'Администраторы могут изменять всё на сайте: принимать и удалять поставки, вести меню, оформлять заказы. Остальные пользователи видят данные, но не меняют их.')}
+      ${pageHeader('Администрирование', 'Первые два зарегистрированных пользователя — администраторы: принимают и удаляют поставки, сохраняют заявки, ведут меню, оформляют заказы. Остальные — менеджеры: видят все данные на сайте, но не меняют их.')}
       <div class="form-head" style="margin-bottom:16px">
         <h2 class="panel-title">Пользователи</h2>
         <span class="form-msg" id="usersMsg" role="status"></span>
@@ -477,7 +479,7 @@
         <div class="stop-summary" style="margin-bottom:20px">
           <div class="glass stat"><div class="big">${users.length}</div><div class="small">всего аккаунтов</div></div>
           <div class="glass stat"><div class="big">${admins}</div><div class="small">могут изменять данные</div></div>
-          <div class="glass stat"><div class="big">${users.length - admins}</div><div class="small">только просмотр</div></div>
+          <div class="glass stat"><div class="big">${users.length - admins}</div><div class="small">менеджеров — только просмотр</div></div>
         </div>
         <div class="glass table-wrap"><table class="table">
           <thead><tr><th>Имя</th><th>Почта</th><th>Роль</th><th></th></tr></thead>
@@ -488,7 +490,7 @@
                 const action = isMe
                   ? '<span class="dim">это вы</span>'
                   : user.role === 'admin'
-                    ? `<button type="button" class="btn btn-sm btn-line" data-role="viewer" data-confirm="Точно снять?">Снять права</button>`
+                    ? `<button type="button" class="btn btn-sm btn-line" data-role="manager" data-confirm="Точно снять?">Сделать менеджером</button>`
                     : `<button type="button" class="btn btn-sm btn-solid" data-role="admin">Сделать администратором</button>`
                 return `<tr data-user="${escapeHtml(user.id)}" data-name="${escapeHtml(user.name)}">
                   <td class="strong">${escapeHtml(user.name)}</td>
@@ -899,6 +901,8 @@
     refreshView = null
     setMenu(false)
     app.className = PUBLIC.includes(path) ? 'app is-home' : 'app'
+    // Менеджер видит все данные, но кнопки изменения у него скрыты.
+    if (API.getUser() && !isAdmin()) app.classList.add('is-viewer')
     renderNav(path)
     window.scrollTo(0, 0)
 

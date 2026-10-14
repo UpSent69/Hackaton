@@ -176,8 +176,10 @@ const UI = (() => {
   // проверяет API: страница не перенаправляет пользователя при 401/403.
   function shell(active) {
     const user = API.getUser()
+    const admin = Boolean(user && user.role === 'admin')
     const app = document.getElementById('app')
-    app.classList.remove('is-viewer')
+    // Менеджер видит все данные, но кнопки изменения у него скрыты (см. [data-admin] в styles.css).
+    app.classList.toggle('is-viewer', Boolean(user) && !admin)
 
     const links = NAV.map(([key, label, href]) => `<a href="${href}"${key === active ? ' class="active"' : ''}>${label}</a>`).join('')
     const old = app.querySelector('.nav')
@@ -192,21 +194,35 @@ const UI = (() => {
         <nav class="nav-links" aria-label="Основная навигация">${links}</nav>
         <div class="nav-actions">
           <span class="nav-user" title="${escapeHtml(user?.email || '')}">${escapeHtml(user?.name || 'Сессия определяется сервером')}</span>
-          <a class="btn btn-line btn-sm" href="app.html#/admin">Администрирование</a>
+          ${admin ? '<a class="btn btn-line btn-sm" href="app.html#/admin">Администрирование</a>' : ''}
           <span class="label tag clock-chip" id="clockChip" hidden></span>
-          <a class="btn btn-line btn-sm" href="login.html">Войти</a>
-          <button type="button" class="btn btn-line btn-sm" data-logout>Выйти</button>
+          ${user ? '<button type="button" class="btn btn-line btn-sm" data-logout>Выйти</button>' : '<a class="btn btn-line btn-sm" href="login.html">Войти</a>'}
         </div>
         <button class="burger" id="burger" aria-label="Открыть меню" aria-expanded="false" aria-controls="menu"><span></span></button>
       </header>
       <nav class="menu" id="menu" aria-label="Мобильная навигация">
         ${links}<div class="divider"></div>
-        <a href="app.html#/admin">Администрирование</a>
-        <a href="login.html">Войти</a>
-        <a href="index.html" data-logout>Завершить сессию</a>
+        ${admin ? '<a href="app.html#/admin">Администрирование</a>' : ''}
+        ${user ? '<a href="index.html" data-logout>Завершить сессию</a>' : '<a href="login.html">Войти</a>'}
       </nav>`,
     )
+    refreshRole(() => shell(active))
     return true
+  }
+
+  // Роль могли поменять, пока пользователь сидит на сайте: сверяем её с сервером
+  // и при изменении перерисовываем шапку и доступные кнопки.
+  let roleChecked = false
+  function refreshRole(redraw) {
+    if (roleChecked || !API.getUser()) return
+    roleChecked = true
+    API.get('/auth/me')
+      .then((me) => {
+        if (!me || me.role === API.getUser().role) return
+        API.updateUser(me)
+        redraw()
+      })
+      .catch(() => {})
   }
 
   function setMenu(open) {

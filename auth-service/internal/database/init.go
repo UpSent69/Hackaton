@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -33,7 +34,7 @@ func Init(dbPath string) (*sql.DB, error) {
 		"id INTEGER PRIMARY KEY AUTOINCREMENT, login TEXT UNIQUE NOT NULL, password TEXT NOT NULL);" +
 		"CREATE TABLE IF NOT EXISTS accounts (" +
 		"id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE, " +
-		"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','viewer')), created_at TEXT NOT NULL);" +
+		"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager')), created_at TEXT NOT NULL);" +
 		"CREATE TABLE IF NOT EXISTS auth_sessions (" +
 		"jti TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, " +
 		"expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);" +
@@ -107,6 +108,11 @@ func Init(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("migrate batch lot number: %w", err)
 	}
 
+	if err := migrateRoles(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate account roles: %w", err)
+	}
+
 	// Migrate administrator records created by the older application.
 	// Fresh installations intentionally start without a seeded account: the first
 	// successful registration becomes the administrator, as specified by API.md.
@@ -162,4 +168,44 @@ func ensureColumn(db *sql.DB, table, column, definition string) error {
 	}
 	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition)
 	return err
+}
+
+// migrateRoles переводит старую роль «viewer» в «manager». Ограничение CHECK в SQLite
+// нельзя изменить на месте, поэтому таблица пересобирается; внешние ключи на время
+// выключены, чтобы сессии пользователей не удалились каскадом.
+// Один раз, при первом запуске новой версии, второй по порядку аккаунт тоже становится
+// администратором: правило «первые два — администраторы» действует и для старых баз.
+func migrateRoles(db *sql.DB) error {
+	var schema string
+	if err := db.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'").Scan(&schema); err != nil {
+		return err
+	}
+	if !strings.Contains(schema, "'viewer'") {
+		return nil
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys = OFF"); err != nil {
+		return err
+	}
+	defer db.Exec("PRAGMA foreign_keys = ON")
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, statement := range []string{
+		"CREATE TABLE accounts_new (" +
+			"id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE, " +
+			"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager')), created_at TEXT NOT NULL)",
+		"INSERT INTO accounts_new(id,name,email,password_hash,role,created_at) " +
+			"SELECT id,name,email,password_hash,CASE WHEN role='admin' THEN 'admin' ELSE 'manager' END,created_at FROM accounts",
+		"DROP TABLE accounts",
+		"ALTER TABLE accounts_new RENAME TO accounts",
+		"UPDATE accounts SET role='admin' WHERE id IN (SELECT id FROM accounts ORDER BY id LIMIT 2)",
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

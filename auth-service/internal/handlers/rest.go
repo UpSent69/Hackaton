@@ -77,6 +77,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("GET", "/api/pulse", false, a.Pulse)
 	authed("GET", "/api/hot-offers", false, a.HotOffers)
 	authed("GET", "/api/analytics", false, a.Analytics)
+	mux.Handle("GET /api/analytics/ai", a.protectLongRunning(false, a.AnalyticsInsight))
 
 	authed("GET", "/api/demo/state", false, a.DemoState)
 	authed("POST", "/api/demo/clock", true, a.DemoClock)
@@ -181,7 +182,7 @@ func (a *API) authenticate(r *http.Request) (*authContext, error) {
 	if err != nil || !time.Now().UTC().Before(expiration) {
 		return nil, errors.New("session expired")
 	}
-	if role != string(contract.RoleAdmin) && role != string(contract.RoleViewer) {
+	if role != string(contract.RoleAdmin) && role != string(contract.RoleManager) {
 		return nil, errors.New("invalid role")
 	}
 	return &authContext{
@@ -237,8 +238,9 @@ func (a *API) Register(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось проверить пользователей")
 		return
 	}
-	role := contract.RoleViewer
-	if count == 0 {
+	// Первые два аккаунта — администраторы, остальные — менеджеры (только просмотр).
+	role := contract.RoleManager
+	if count < 2 {
 		role = contract.RoleAdmin
 	}
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
@@ -379,8 +381,8 @@ func (a *API) SetUserRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req contract.SetRoleRequest
-	if err := decodeJSON(w, r, &req); err != nil || (req.Role != contract.RoleAdmin && req.Role != contract.RoleViewer) {
-		a.writeError(w, http.StatusBadRequest, "Выберите роль «admin» или «viewer»")
+	if err := decodeJSON(w, r, &req); err != nil || (req.Role != contract.RoleAdmin && req.Role != contract.RoleManager) {
+		a.writeError(w, http.StatusBadRequest, "Выберите роль «admin» или «manager»")
 		return
 	}
 	result, err := a.DB.Exec("UPDATE accounts SET role=? WHERE id=?", string(req.Role), id)
