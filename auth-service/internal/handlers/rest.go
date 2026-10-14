@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/mail"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("POST /api/auth/register", a.Register)
 	mux.HandleFunc("POST /api/auth/login", a.Login)
+	mux.HandleFunc("GET /api/auth/registration", a.Registration)
 
 	authed := func(method, path string, admin bool, handler http.HandlerFunc) {
 		mux.Handle(method+" "+path, a.protect(admin, handler))
@@ -50,6 +52,8 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("GET", "/api/auth/me", false, a.Me)
 	authed("GET", "/api/users", true, a.Users)
 	authed("POST", "/api/users/{id}/role", true, a.SetUserRole)
+	authed("POST", "/api/users", true, a.CreateManager)
+	authed("DELETE", "/api/users/{id}", true, a.DeleteManager)
 
 	authed("GET", "/api/products", false, a.Products)
 	authed("POST", "/api/products/{productId}/price", true, a.UpdateProductPrice)
@@ -233,16 +237,18 @@ func (a *API) Register(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось создать пароль")
 		return
 	}
-	var count int
-	if err := a.DB.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&count); err != nil {
+	// Самостоятельно регистрируются только первые два администратора.
+	// Менеджеров заводит администратор на странице «Администрирование».
+	open, err := a.registrationOpen()
+	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось проверить пользователей")
 		return
 	}
-	// Первые два аккаунта — администраторы, остальные — менеджеры (только просмотр).
-	role := contract.RoleManager
-	if count < 2 {
-		role = contract.RoleAdmin
+	if !open {
+		a.writeError(w, http.StatusForbidden, "Регистрация закрыта: аккаунт менеджера выдаёт администратор")
+		return
 	}
+	role := contract.RoleAdmin
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := a.DB.Exec(
 		"INSERT INTO accounts(name,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
@@ -288,7 +294,7 @@ func (a *API) Login(w http.ResponseWriter, r *http.Request) {
 		email,
 	).Scan(&id, &name, &storedEmail, &passwordHash, &role)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)) != nil {
-		a.writeError(w, http.StatusUnauthorized, "Почта или пароль неверны")
+		a.writeError(w, http.StatusUnauthorized, "Логин или пароль неверны")
 		return
 	}
 	user := contract.User{ID: strconv.FormatInt(id, 10), Name: name, Email: storedEmail, Role: contract.Role(role)}
@@ -543,4 +549,97 @@ func safeRowsErr(rows *sql.Rows) error {
 		return nil
 	}
 	return rows.Err()
+}
+
+var managerLoginPattern = regexp.MustCompile(`^[a-z0-9._-]{3,64}$`)
+
+// registrationOpen — регистрация открыта, пока в системе меньше двух администраторов.
+func (a *API) registrationOpen() (bool, error) {
+	var admins int
+	err := a.DB.QueryRow("SELECT COUNT(*) FROM accounts WHERE role=?", string(contract.RoleAdmin)).Scan(&admins)
+	return admins < 2, err
+}
+
+// Registration сообщает форме входа, показывать ли ссылку на регистрацию.
+func (a *API) Registration(w http.ResponseWriter, r *http.Request) {
+	requestMu.Lock()
+	defer requestMu.Unlock()
+	open, err := a.registrationOpen()
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось проверить регистрацию")
+		return
+	}
+	a.sendJSON(w, http.StatusOK, contract.RegistrationState{Open: open})
+}
+
+// CreateManager — администратор заводит менеджера по логину и паролю. Логин хранится
+// в том же поле, что и почта администратора, поэтому входит менеджер через ту же форму.
+func (a *API) CreateManager(w http.ResponseWriter, r *http.Request) {
+	var req contract.CreateManagerRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		a.writeError(w, http.StatusBadRequest, "Укажите логин и пароль")
+		return
+	}
+	login := strings.ToLower(strings.TrimSpace(req.Login))
+	if !managerLoginPattern.MatchString(login) {
+		a.writeError(w, http.StatusBadRequest, "Логин: от 3 до 64 символов — латиница, цифры, точка, дефис или подчёркивание")
+		return
+	}
+	if len(req.Password) < 6 {
+		a.writeError(w, http.StatusBadRequest, "Пароль должен содержать не менее 6 символов")
+		return
+	}
+	if len(req.Password) > 72 {
+		a.writeError(w, http.StatusBadRequest, "Пароль слишком длинный")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось создать пароль")
+		return
+	}
+	result, err := a.DB.Exec(
+		"INSERT INTO accounts(name,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
+		login, login, string(hash), string(contract.RoleManager), time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "constraint") {
+			a.writeError(w, http.StatusConflict, "Пользователь с таким логином уже есть")
+			return
+		}
+		a.writeError(w, http.StatusInternalServerError, "Не удалось создать менеджера")
+		return
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось создать менеджера")
+		return
+	}
+	a.bumpRev()
+	a.sendJSON(w, http.StatusCreated, contract.User{ID: strconv.FormatInt(id, 10), Name: login, Email: login, Role: contract.RoleManager})
+}
+
+// DeleteManager удаляет менеджера вместе с его сессиями. Администраторов так удалить нельзя.
+func (a *API) DeleteManager(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r.PathValue("id"))
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор пользователя")
+		return
+	}
+	// Сессии удаляются явно, не полагаясь только на каскад внешнего ключа.
+	if _, err := a.DB.Exec("DELETE FROM auth_sessions WHERE user_id IN (SELECT id FROM accounts WHERE id=? AND role=?)", id, string(contract.RoleManager)); err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить пользователя")
+		return
+	}
+	result, err := a.DB.Exec("DELETE FROM accounts WHERE id=? AND role=?", id, string(contract.RoleManager))
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить пользователя")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		a.writeError(w, http.StatusNotFound, "Менеджер не найден")
+		return
+	}
+	a.bumpRev()
+	w.WriteHeader(http.StatusNoContent)
 }

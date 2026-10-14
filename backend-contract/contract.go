@@ -62,8 +62,19 @@ type RegisterRequest struct {
 }
 
 type LoginRequest struct {
-	Email    string `json:"email"`
+	Email    string `json:"email"` // почта администратора или логин менеджера
 	Password string `json:"password"`
+}
+
+// CreateManagerRequest — администратор заводит менеджера: логин и пароль.
+type CreateManagerRequest struct {
+	Login    string `json:"login"`    // латиница, цифры, «.», «_», «-», от 3 до 64 символов
+	Password string `json:"password"` // не короче 6 символов
+}
+
+// RegistrationState — открыта ли самостоятельная регистрация (только для первых двух администраторов).
+type RegistrationState struct {
+	Open bool `json:"open"`
 }
 
 // Session — ответ на регистрацию и вход. Token фронт присылает в заголовке

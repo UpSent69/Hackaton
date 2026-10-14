@@ -550,7 +550,7 @@
           type="text"
           id="username"
           class="form-input"
-          placeholder="Введите почту"
+          placeholder="Введите почту или логин"
           autocomplete="username"
           required
         >
@@ -560,7 +560,7 @@
             <circle cx="12" cy="7" r="4"/>
           </svg>
         </div>
-        <div class="error-message" id="usernameError">Введите почту</div>
+        <div class="error-message" id="usernameError">Введите почту или логин</div>
       </div>
 
       <div class="form-group">
@@ -743,8 +743,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const form = document.getElementById('loginForm');
     const hint = document.createElement('div');
     hint.style.cssText = 'margin-top:18px; font-size:13px; line-height:1.5; color:#a5a5a5; text-align:center';
-    hint.innerHTML = 'Нет аккаунта? <a href="app.html#/register" style="color:#fff">Зарегистрироваться</a>';
     form.after(hint);
+    // Регистрируются сами только первые два администратора, остальным аккаунт выдаёт администратор.
+    API.get('/auth/registration')
+      .then((state) => {
+        hint.innerHTML = state.open
+          ? 'Нет аккаунта? <a href="app.html#/register" style="color:#fff">Зарегистрироваться</a>'
+          : 'Нет аккаунта? Его выдаёт администратор.';
+      })
+      .catch(() => {});
 
     // Health endpoint не зависит от входа и помогает отличить недоступный сервер от неверных данных.
     API.get('/health').catch((error) => {

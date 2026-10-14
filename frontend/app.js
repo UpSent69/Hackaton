@@ -189,7 +189,7 @@
                   ? '<label class="field"><span class="label">Имя</span><input class="input" name="name" autocomplete="name" placeholder="Как к вам обращаться" /></label>'
                   : ''
               }
-              <label class="field"><span class="label">Почта</span><input class="input" name="email" type="email" autocomplete="email" placeholder="you@example.com" /></label>
+              <label class="field"><span class="label">${isRegister ? 'Почта' : 'Почта или логин'}</span><input class="input" name="email" type="${isRegister ? 'email' : 'text'}" autocomplete="${isRegister ? 'email' : 'username'}" placeholder="${isRegister ? 'you@example.com' : 'you@example.com или логин'}" /></label>
               <label class="field"><span class="label">Пароль</span><input class="input" name="password" type="password" autocomplete="${isRegister ? 'new-password' : 'current-password'}" placeholder="${isRegister ? 'Не короче 6 символов' : 'Ваш пароль'}" /></label>
               ${
                 isRegister
@@ -203,7 +203,7 @@
               ${
                 isRegister
                   ? `Уже есть аккаунт? <a href="login.html?next=${encodeURIComponent(next)}">Войти</a>`
-                  : `Нет аккаунта? <a href="#/register?next=${encodeURIComponent(next)}">Зарегистрироваться</a>`
+                  : `<span id="registerHint">Нет аккаунта? Его выдаёт администратор.</span>`
               }
             </p>
           </div>
@@ -220,6 +220,17 @@
     const form = document.getElementById('authForm')
     const message = document.getElementById('authMsg')
     form.querySelector('input').focus()
+
+    // Регистрация открыта только для первых двух администраторов.
+    API.get('/auth/registration')
+      .then((state) => {
+        const hint = document.getElementById('registerHint')
+        if (hint && state.open) hint.innerHTML = `Нет аккаунта? <a href="#/register?next=${encodeURIComponent(next)}">Зарегистрироваться</a>`
+        if (isRegister && !state.open && document.body.contains(form)) {
+          form.outerHTML = '<div class="glass empty" style="margin-top:24px"><h3>Регистрация закрыта</h3><p>Администраторы уже назначены. Аккаунт менеджера выдаёт администратор.</p></div>'
+        }
+      })
+      .catch(() => {})
 
     // Проверяем доступность API. Состояние сессии и права определяет backend.
     API.get('/health').catch((error) => {
@@ -239,7 +250,7 @@
       // Проверка на клиенте — только для удобства, сервер проверяет всё заново.
       const invalid = []
       if (isRegister && !data.name.trim()) invalid.push(['name', 'Укажите имя'])
-      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(data.email.trim())) invalid.push(['email', 'Укажите корректную почту'])
+      if (isRegister ? !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(data.email.trim()) : !data.email.trim()) invalid.push(['email', isRegister ? 'Укажите корректную почту' : 'Введите почту или логин'])
       if (isRegister ? data.password.length < 6 : !data.password) invalid.push(['password', isRegister ? 'Пароль должен быть не короче 6 символов' : 'Введите пароль'])
       if (isRegister && data.password !== data.repeat) invalid.push(['repeat', 'Пароли не совпадают'])
       if (invalid.length) {
@@ -453,8 +464,22 @@
     `<span class="label status" style="--status-color:${role === 'admin' ? STATUS.ok.color : 'rgba(255,255,255,0.3)'}">${role === 'admin' ? 'Администратор' : 'Менеджер'}</span>`
 
   async function adminView() {
+    // Менеджерам страница не нужна: пользователей видит и заводит только администратор.
+    if (!isAdmin()) {
+      view.innerHTML = `<main class="page">${pageHeader('Администрирование', '')}<div class="glass empty"><h3>Нет прав</h3><p>Управлять пользователями может только администратор.</p></div></main>`
+      return
+    }
     view.innerHTML = `<main class="page">
       ${pageHeader('Администрирование', 'Первые два зарегистрированных пользователя — администраторы: принимают и удаляют поставки, сохраняют заявки, ведут меню, оформляют заказы. Остальные — менеджеры: видят все данные на сайте, но не меняют их.')}
+      <form class="glass form" id="managerForm" novalidate style="margin-bottom:32px">
+        <h2 class="panel-title">Добавить менеджера</h2>
+        <div class="supply-row" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto">
+          <label class="field"><span class="label">Логин</span><input class="input" name="login" autocomplete="off" placeholder="Например, ivanov" /></label>
+          <label class="field"><span class="label">Пароль</span><input class="input" name="password" type="password" autocomplete="new-password" placeholder="Не короче 6 символов" /></label>
+          <button type="submit" class="btn btn-solid">Создать</button>
+        </div>
+        <span class="form-msg" id="managerMsg" role="status"></span>
+      </form>
       <div class="form-head" style="margin-bottom:16px">
         <h2 class="panel-title">Пользователи</h2>
         <span class="form-msg" id="usersMsg" role="status"></span>
@@ -491,7 +516,8 @@
                   ? '<span class="dim">это вы</span>'
                   : user.role === 'admin'
                     ? `<button type="button" class="btn btn-sm btn-line" data-role="manager" data-confirm="Точно снять?">Сделать менеджером</button>`
-                    : `<button type="button" class="btn btn-sm btn-solid" data-role="admin">Сделать администратором</button>`
+                    : `<button type="button" class="btn btn-sm btn-solid" data-role="admin">Сделать администратором</button>
+                       <button type="button" class="btn btn-sm btn-line" data-delete data-confirm="Точно удалить?">Удалить</button>`
                 return `<tr data-user="${escapeHtml(user.id)}" data-name="${escapeHtml(user.name)}">
                   <td class="strong">${escapeHtml(user.name)}</td>
                   <td class="dim">${escapeHtml(user.email)}</td>
@@ -502,10 +528,56 @@
               .join('')}
           </tbody>
         </table></div>
-        ${users.length === 1 ? '<p class="page-sub" style="margin-top:16px">Других аккаунтов пока нет. Когда коллеги зарегистрируются, они появятся здесь, и вы сможете выдать им права.</p>' : ''}`
+        ${users.length === 1 ? '<p class="page-sub" style="margin-top:16px">Других аккаунтов пока нет. Добавьте менеджеров формой выше.</p>' : ''}`
     }
 
+    const managerForm = document.getElementById('managerForm')
+    const managerMsg = document.getElementById('managerMsg')
+    managerForm.addEventListener('submit', async (event) => {
+      event.preventDefault()
+      const login = managerForm.elements.login.value.trim().toLowerCase()
+      const password = managerForm.elements.password.value
+      managerForm.querySelectorAll('.input').forEach((input) => input.classList.remove('is-invalid'))
+      if (!/^[a-z0-9._-]{3,64}$/.test(login)) {
+        managerForm.elements.login.classList.add('is-invalid')
+        setMessage(managerMsg, 'Логин: от 3 до 64 символов — латиница, цифры, точка, дефис или подчёркивание', true)
+        return
+      }
+      if (password.length < 6) {
+        managerForm.elements.password.classList.add('is-invalid')
+        setMessage(managerMsg, 'Пароль должен быть не короче 6 символов', true)
+        return
+      }
+      const submit = managerForm.querySelector('[type=submit]')
+      submit.disabled = true
+      try {
+        await call(API.post('/users', { login, password }))
+        setMessage(managerMsg, `Менеджер ${login} создан — он может войти с этим логином и паролем`)
+        managerForm.reset()
+        await loadUsers()
+      } catch (error) {
+        setMessage(managerMsg, error.message, true)
+      } finally {
+        submit.disabled = false
+      }
+    })
+
     body.addEventListener('click', async (event) => {
+      const remove = event.target.closest('[data-delete]')
+      if (remove) {
+        if (!confirmClick(remove)) return
+        const row = remove.closest('tr')
+        remove.disabled = true
+        try {
+          await call(API.del('/users/' + encodeURIComponent(row.dataset.user)))
+          setMessage(message, `${row.dataset.name} удалён`)
+          await loadUsers()
+        } catch (error) {
+          setMessage(message, error.message, true)
+          remove.disabled = false
+        }
+        return
+      }
       const button = event.target.closest('[data-role]')
       if (!button) return
       // Снятие прав — в два нажатия, выдача — сразу.
@@ -514,7 +586,7 @@
       button.disabled = true
       try {
         await call(API.post('/users/' + encodeURIComponent(row.dataset.user) + '/role', { role: button.dataset.role }))
-        setMessage(message, button.dataset.role === 'admin' ? `${row.dataset.name} теперь администратор` : `${row.dataset.name} теперь может только просматривать`)
+        setMessage(message, button.dataset.role === 'admin' ? `${row.dataset.name} теперь администратор` : `${row.dataset.name} теперь менеджер`)
         await loadUsers()
       } catch (error) {
         setMessage(message, error.message, true)
