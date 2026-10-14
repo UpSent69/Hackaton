@@ -435,7 +435,7 @@ func (a *API) loadSupply(id int64) (contract.Supply, error) {
 	supply.ID = strconv.FormatInt(id, 10)
 	supply.CreatedAt = parseTime(created)
 	rows, err := a.DB.Query(
-		"SELECT p.id,p.name,p.unit,b.qty_initial,b.expires_at FROM batches b "+
+		"SELECT p.id,p.name,p.unit,b.qty_initial,b.expires_at,b.lot_number FROM batches b "+
 			"JOIN products p ON p.id=b.product_id WHERE b.supply_id=? ORDER BY p.name COLLATE NOCASE,b.id",
 		id,
 	)
@@ -447,7 +447,7 @@ func (a *API) loadSupply(id int64) (contract.Supply, error) {
 		var productID int64
 		var item contract.SupplyItem
 		var expires string
-		if err := rows.Scan(&productID, &item.Name, &item.Unit, &item.Quantity, &expires); err != nil {
+		if err := rows.Scan(&productID, &item.Name, &item.Unit, &item.Quantity, &expires, &item.LotNumber); err != nil {
 			rows.Close()
 			return supply, err
 		}
@@ -480,7 +480,7 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 		key := normalizeName(item.Name)
 		if key == "" || len(item.Name) > 160 || !validUnit(item.Unit) || item.Quantity <= 0 ||
 			item.ShelfLifeHours <= 0 || math.IsNaN(item.ShelfLifeHours) || math.IsInf(item.ShelfLifeHours, 0) ||
-			item.ShelfLifeHours > 87600 {
+			item.ShelfLifeHours > 87600 || len(strings.TrimSpace(item.LotNumber)) > 40 {
 			a.writeError(w, http.StatusBadRequest, "Проверьте названия, единицы, количества и сроки хранения продуктов")
 			return
 		}
@@ -489,6 +489,15 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen[key] = true
+	}
+
+	var importID int64
+	if strings.TrimSpace(req.ImportID) != "" {
+		var parseErr error
+		if importID, parseErr = parseID(req.ImportID); parseErr != nil {
+			a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор импорта поставки")
+			return
+		}
 	}
 
 	now, _ := a.nowAndSpeed()
@@ -543,12 +552,27 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 
 		expires := now.Add(time.Duration(item.ShelfLifeHours * float64(time.Hour)))
 		status := batchStatus(now, expires, now)
+		lot := strings.TrimSpace(item.LotNumber)
+		if lot == "" {
+			lot = randomLotNumber()
+		}
 		if _, err := tx.Exec(
-			"INSERT INTO batches(product_id,supply_id,qty_initial,qty_remaining,written_off,received_at,expires_at,last_status) "+
-				"VALUES(?,?,?,?,0,?,?,?)",
-			productID, supplyID, item.Quantity, item.Quantity, formatTime(now), formatTime(expires), string(status),
+			"INSERT INTO batches(product_id,supply_id,qty_initial,qty_remaining,written_off,received_at,expires_at,last_status,lot_number) "+
+				"VALUES(?,?,?,?,0,?,?,?,?)",
+			productID, supplyID, item.Quantity, item.Quantity, formatTime(now), formatTime(expires), string(status), lot,
 		); err != nil {
 			a.writeError(w, http.StatusInternalServerError, "Не удалось создать партию продукта")
+			return
+		}
+	}
+	// The import journal row is linked in the same transaction, so a saved supply always
+	// points back to the file it was recognised from.
+	if importID > 0 {
+		if _, err := tx.Exec(
+			"UPDATE supply_imports SET supply_id=?,saved_at=? WHERE id=? AND supply_id IS NULL",
+			supplyID, formatTime(now), importID,
+		); err != nil {
+			a.writeError(w, http.StatusInternalServerError, "Не удалось связать поставку с импортом")
 			return
 		}
 	}

@@ -62,6 +62,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("GET", "/api/expiry", false, a.Expiry)
 	authed("GET", "/api/supplies", false, a.Supplies)
 	authed("POST", "/api/supplies", true, a.CreateSupply)
+	mux.Handle("POST /api/supplies/parse", a.protectLongRunning(true, a.ParseSupplyFile))
 	authed("DELETE", "/api/supplies/{id}", true, a.DeleteSupply)
 	authed("DELETE", "/api/supplies/{id}/items/{productId}", true, a.DeleteSupplyItem)
 

@@ -81,6 +81,12 @@ func Init(dbPath string) (*sql.DB, error) {
 		"item_discount_percent INTEGER NOT NULL CHECK(item_discount_percent BETWEEN 0 AND 100), " +
 		"subtotal_kopecks INTEGER NOT NULL, total_kopecks INTEGER NOT NULL);" +
 		"CREATE INDEX IF NOT EXISTS idx_customer_request_items_request ON customer_request_items(request_id, id);" +
+		"CREATE TABLE IF NOT EXISTS supply_imports (" +
+		"id INTEGER PRIMARY KEY AUTOINCREMENT, source_filename TEXT NOT NULL DEFAULT '', source_sha256 TEXT NOT NULL DEFAULT '', " +
+		"parser_mode TEXT NOT NULL, ai_used INTEGER NOT NULL DEFAULT 0, detected_number TEXT NOT NULL DEFAULT '', " +
+		"items_json TEXT NOT NULL DEFAULT '[]', warnings_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, " +
+		"supply_id INTEGER NULL REFERENCES supplies(id) ON DELETE SET NULL, saved_at TEXT NULL);" +
+		"CREATE INDEX IF NOT EXISTS idx_supply_imports_hash ON supply_imports(source_sha256);" +
 		"CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);" +
 		"CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);" +
 		"CREATE INDEX IF NOT EXISTS idx_alerts_at ON alerts(at DESC);"
@@ -94,6 +100,11 @@ func Init(dbPath string) (*sql.DB, error) {
 	if err := ensureColumn(db, "products", "base_price_kopecks", "INTEGER NULL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate product catalogue price: %w", err)
+	}
+	// Batch (lot) number of a supply row; older batches simply keep an empty value.
+	if err := ensureColumn(db, "batches", "lot_number", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate batch lot number: %w", err)
 	}
 
 	// Migrate administrator records created by the older application.

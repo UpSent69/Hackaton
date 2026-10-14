@@ -130,8 +130,9 @@ type ExpiryBatch struct {
 // ---------- Поставки ----------
 
 type CreateSupplyRequest struct {
-	Number string            `json:"number"` // номер поставки, уникален
-	Items  []SupplyItemInput `json:"items"`  // не пустой
+	Number   string            `json:"number"`             // номер поставки, уникален
+	Items    []SupplyItemInput `json:"items"`              // не пустой
+	ImportID string            `json:"importId,omitempty"` // id из POST /supplies/parse, если строки распознаны из файла
 }
 
 // SupplyItemInput — строка поставки. Продукт находится по названию без учёта регистра и «ё/е»;
@@ -140,7 +141,8 @@ type SupplyItemInput struct {
 	Name           string  `json:"name"`
 	Unit           Unit    `json:"unit"`
 	Quantity       int64   `json:"quantity"`       // больше нуля
-	ShelfLifeHours float64 `json:"shelfLifeHours"` // больше нуля
+	ShelfLifeHours float64 `json:"shelfLifeHours"`      // больше нуля
+	LotNumber      string  `json:"lotNumber,omitempty"` // номер партии; пустой — сервер сгенерирует случайный
 }
 
 type Supply struct {
@@ -156,6 +158,7 @@ type SupplyItem struct {
 	Unit      Unit      `json:"unit"`
 	Quantity  int64     `json:"quantity"`
 	ExpiresAt time.Time `json:"expiresAt"`
+	LotNumber string    `json:"lotNumber"`
 }
 
 // ---------- Меню ----------

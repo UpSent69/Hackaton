@@ -81,8 +81,8 @@
             <h2 class="panel-title">Новая поставка</h2>
             <div class="form-head-actions">
               <button type="button" class="text-btn" id="templateBtn">Скачать шаблон</button>
-              <button type="button" class="btn btn-line btn-sm" id="importBtn">Импорт из Excel</button>
-              <input type="file" id="importFile" accept=".xlsx,.csv" hidden />
+              <button type="button" class="btn btn-line btn-sm" id="importBtn">Импорт файла</button>
+              <input type="file" id="importFile" accept=".xlsx,.csv,.tsv,.txt,.md,.log,.json,.xml,.docx,.pdf,.png,.jpg,.jpeg" hidden />
             </div>
           </div>
           <label class="field" style="max-width: 280px">
@@ -153,8 +153,8 @@
         /* ---------- Форма ---------- */
 
         function rowHtml(data, animate) {
-          const row = data || { name: '', unit: 'g', quantity: '', shelfLifeHours: '' }
-          return `<div class="supply-row${animate ? ' is-in' : ''}">
+          const row = data || { name: '', unit: 'g', quantity: '', shelfLifeHours: '', lotNumber: '' }
+          return `<div class="supply-row${animate ? ' is-in' : ''}" data-lot="${escapeHtml(row.lotNumber || '')}">
             <div class="field"><input class="input" name="name" list="productNames" aria-label="Продукт" placeholder="Название продукта" autocomplete="off" value="${escapeHtml(row.name)}" /></div>
             <div class="field"><select class="input" name="unit" aria-label="Единица">
               ${Object.entries(UNIT_LABEL).map(([value, label]) => `<option value="${value}"${value === row.unit ? ' selected' : ''}>${label}</option>`).join('')}
@@ -171,6 +171,7 @@
           unit: row.querySelector('[name=unit]').value,
           quantity: row.querySelector('[name=quantity]').value,
           shelfLifeHours: row.querySelector('[name=shelfLifeHours]').value,
+          lotNumber: row.dataset.lot || '',
         })
         const isBlank = (data) => !data.name && !data.quantity && !data.shelfLifeHours
 
@@ -206,65 +207,10 @@
           rows.lastElementChild.querySelector('input').focus()
         })
 
-        /* ---------- Импорт из Excel ---------- */
+        /* ---------- Импорт из файла ---------- */
 
-        // Единицы из файла: «кг» и «л» переводятся в базовые граммы и миллилитры.
-        const UNIT_ALIASES = {
-          г: ['g', 1], гр: ['g', 1], g: ['g', 1], кг: ['g', 1000], kg: ['g', 1000],
-          мл: ['ml', 1], ml: ['ml', 1], л: ['ml', 1000], l: ['ml', 1000],
-          шт: ['pcs', 1], штук: ['pcs', 1], pcs: ['pcs', 1],
-        }
-
-        const loadScript = (src) =>
-          new Promise((resolve, reject) => {
-            const script = document.createElement('script')
-            script.src = src
-            script.onload = resolve
-            script.onerror = () => reject(new Error('Не удалось загрузить ' + src))
-            document.head.append(script)
-          })
-
-        function parseCsv(text) {
-          const lines = text.replace(/^﻿/, '').split(/\r?\n/)
-          // Русский Excel сохраняет CSV через точку с запятой, остальные — через запятую или табуляцию.
-          const separator = [';', '\t', ','].find((symbol) => lines[0].includes(symbol)) || ';'
-          return lines.map((line) => line.split(separator).map((cell) => cell.trim().replace(/^"(.*)"$/, '$1')))
-        }
-
-        async function readTable(file) {
-          if (/\.(csv|txt)$/i.test(file.name)) return parseCsv(await file.text())
-          // Библиотека для .xlsx подгружается только при первом импорте.
-          if (!window.readXlsxFile) await loadScript('vendor/read-excel-file.min.js')
-          const result = await window.readXlsxFile(file)
-          // Разные версии библиотеки отдают либо строки первого листа, либо список листов.
-          return Array.isArray(result[0]) || result.length === 0 ? result : result[0].data
-        }
-
-        // Колонки файла: продукт, количество, срок хранения в часах, единица (необязательно).
-        async function parseSupplyFile(file) {
-          const table = await readTable(file)
-          const toNumber = (value) => (typeof value === 'number' ? value : Number(String(value ?? '').replace(/\s/g, '').replace(',', '.')))
-          const parsed = []
-          const skipped = []
-          table.forEach((cells, index) => {
-            const [name, quantityCell, shelfCell, unitCell] = cells
-            if (cells.every((cell) => normalize(cell) === '')) return
-            let quantity = toNumber(quantityCell)
-            const shelfLifeHours = toNumber(shelfCell)
-            // Первая строка без чисел — заголовок таблицы.
-            if (index === 0 && Number.isNaN(quantity)) return
-            const known = products.find((product) => normalize(product.name) === normalize(name))
-            const alias = UNIT_ALIASES[normalize(unitCell).replace(/\.$/, '')]
-            const unit = known ? known.unit : alias ? alias[0] : 'g'
-            if (alias && alias[0] === unit) quantity *= alias[1]
-            if (normalize(name) === '' || !(quantity > 0) || !(shelfLifeHours > 0)) {
-              skipped.push(normalize(name) === '' ? 'строка ' + (index + 1) : String(name).trim())
-              return
-            }
-            parsed.push({ name: known ? known.name : String(name).trim(), unit, quantity: Math.round(quantity), shelfLifeHours: Math.round(shelfLifeHours) })
-          })
-          return { parsed, skipped }
-        }
+        // Файл разбирает сервер (Qwen через Ollama, как во вкладке «Заявка»), здесь только показываем строки.
+        let importId = null
 
         // Шаблон в CSV с BOM и точкой с запятой — так его без настроек открывает русский Excel.
         document.getElementById('templateBtn').addEventListener('click', () => {
@@ -289,12 +235,20 @@
           // Сбрасываем поле, чтобы тот же файл можно было выбрать повторно.
           fileInput.value = ''
           if (!file) return
+          const importBtn = document.getElementById('importBtn')
+          importBtn.disabled = true
+          UI.setMessage(formMsg, 'Распознаём документ…')
           try {
-            const { parsed, skipped } = await parseSupplyFile(file)
+            const result = await UI.call(API.upload('/supplies/parse', file))
+            const parsed = result.items || []
+            // Предупреждения о подставленных случайных значениях пользователю не показываем.
+            const warnings = (result.warnings || []).filter((text) => !/случайн/i.test(text))
             if (parsed.length === 0) {
-              UI.setMessage(formMsg, 'В файле не нашлось подходящих строк. Сверьте колонки с шаблоном', true)
+              UI.setMessage(formMsg, warnings.join(' ') || 'В файле не нашлось подходящих строк', true)
               return
             }
+            importId = result.importId || null
+            if (result.supplyNumber && !numberInput.value.trim()) numberInput.value = result.supplyNumber
             // Импорт дополняет уже введённые строки, пустые строки-заготовки выбрасываются.
             rows.querySelectorAll('.supply-row').forEach((row) => isBlank(rowData(row)) && row.remove())
             rows.insertAdjacentHTML('beforeend', parsed.map((row) => rowHtml(row, true)).join(''))
@@ -302,10 +256,11 @@
               row.style.animationDelay = index * 50 + 'ms'
               syncUnit(row)
             })
-            const note = skipped.length ? `, пропущено: ${skipped.length} (${skipped.slice(0, 5).join(', ')})` : ''
-            UI.setMessage(formMsg, `Импортировано строк: ${parsed.length}${note}`)
-          } catch {
-            UI.setMessage(formMsg, 'Не удалось прочитать файл. Поддерживаются .xlsx и .csv', true)
+            UI.setMessage(formMsg, `Распознано строк: ${parsed.length}. Проверьте таблицу и примите поставку${warnings.length ? '. ' + warnings.join(' ') : ''}`)
+          } catch (error) {
+            UI.setMessage(formMsg, error.message || 'Не удалось обработать файл', true)
+          } finally {
+            importBtn.disabled = false
           }
         })
 
@@ -322,7 +277,7 @@
             mark(row.querySelector('[name=name]'), !data.name)
             mark(row.querySelector('[name=quantity]'), !(Number(data.quantity) > 0))
             mark(row.querySelector('[name=shelfLifeHours]'), !(Number(data.shelfLifeHours) > 0))
-            return { name: data.name, unit: data.unit, quantity: Number(data.quantity), shelfLifeHours: Number(data.shelfLifeHours) }
+            return { name: data.name, unit: data.unit, quantity: Number(data.quantity), shelfLifeHours: Number(data.shelfLifeHours), lotNumber: data.lotNumber }
           })
           if (!valid) {
             UI.setMessage(formMsg, 'Заполните номер поставки, продукт, количество и срок хранения в каждой строке', true)
@@ -332,7 +287,8 @@
           const submit = form.querySelector('[type=submit]')
           submit.disabled = true
           try {
-            const supply = await UI.call(API.post('/supplies', { number: numberInput.value.trim(), items }))
+            const supply = await UI.call(API.post('/supplies', { number: numberInput.value.trim(), items, importId: importId || undefined }))
+            importId = null
             UI.setMessage(formMsg, `Поставка ${supply.number} принята, партий создано: ${supply.items.length}`)
             numberInput.value = ''
             rows.innerHTML = rowHtml(null, true)
