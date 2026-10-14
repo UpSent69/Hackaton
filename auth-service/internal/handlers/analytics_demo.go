@@ -386,6 +386,9 @@ func (a *API) computeHotOffers(now time.Time) ([]contract.HotOffer, error) {
 		Until time.Time
 	}
 	candidates := make([]candidateReason, 0)
+	// Партии идут по возрастанию срока, поэтому здесь копится остаток более ранних партий
+	// продукта: при текущем расходе они уходят первыми (FEFO).
+	earlierQty := make(map[int64]float64)
 	for _, batch := range batches {
 		if !now.Before(batch.ExpiresAt) {
 			continue
@@ -399,7 +402,28 @@ func (a *API) computeHotOffers(now time.Time) ([]contract.HotOffer, error) {
 		if window > 72 {
 			window = 72
 		}
+
+		// Объём под риском: сколько останется к концу срока, если ранние партии расходуются первыми.
+		rate := rates[batch.ProductID]
+		consumable := rate*hoursLeft - earlierQty[batch.ProductID]
+		if consumable < 0 {
+			consumable = 0
+		}
+		earlierQty[batch.ProductID] += float64(batch.QtyRemaining)
+		atRisk := float64(batch.QtyRemaining) - consumable
+		if atRisk < 1 {
+			continue
+		}
+
+		// Срочность растёт к концу срока; если партия не успевает расходоваться, она растёт и
+		// по мере того, как проходит срок, — не дожидаясь последнего окна.
 		urgency := 1 - hoursLeft/window
+		if lifeHours > 0 {
+			elapsedShare := 1 - hoursLeft/lifeHours
+			if riskUrgency := elapsedShare * atRisk / float64(batch.QtyRemaining); riskUrgency > urgency {
+				urgency = riskUrgency
+			}
+		}
 		if urgency <= 0 {
 			continue
 		}
@@ -448,17 +472,6 @@ func (a *API) computeHotOffers(now time.Time) ([]contract.HotOffer, error) {
 			continue
 		}
 
-		rate := rates[batch.ProductID]
-		atRisk := float64(batch.QtyRemaining) - rate*hoursLeft
-		if atRisk < 0 {
-			atRisk = 0
-		}
-		if rate <= 0 {
-			atRisk = float64(batch.QtyRemaining)
-		}
-		if atRisk < 1 {
-			continue
-		}
 		for _, use := range active {
 			maxPortionsToSpend := float64(use.Dish.AvailablePortions * use.PerPortion)
 			coverage := math.Min(1, maxPortionsToSpend/atRisk)

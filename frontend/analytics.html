@@ -51,7 +51,20 @@
       .kpi { padding: 22px; display: flex; align-items: center; gap: 18px; }
       .kpi .big { font-size: clamp(26px, 2.8vw, 38px); font-variant-numeric: tabular-nums; }
 
+      /* Аналитика нейросети Qwen */
+      .ai-card { padding: 24px 26px; margin-bottom: 28px; display: grid; gap: 18px; }
+      .ai-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+      .ai-head .panel-title { margin-top: 12px; }
+      .ai-summary { margin: 0; max-width: 85ch; font-size: 16px; line-height: 1.55; letter-spacing: -0.015em; color: var(--ink); }
+      .ai-cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      .ai-col { padding: 18px 20px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255, 255, 255, 0.02); }
+      .ai-col .label { color: var(--ink-soft); }
+      .ai-col ul { margin: 12px 0 0; padding-left: 18px; display: grid; gap: 8px; font-size: 13.5px; line-height: 1.5; color: var(--ink); }
+      .ai-meta { font-size: 12px; color: var(--ink-faint); }
+      .ai-wait { display: flex; align-items: center; gap: 12px; font-size: 14px; color: var(--ink-soft); }
+
       @media (max-width: 900px) {
+        .ai-cols { grid-template-columns: minmax(0, 1fr); }
         .t-axis { display: none; }
         .t-row { grid-template-columns: minmax(0, 1fr) auto; }
         .t-track { grid-column: 1 / -1; order: 3; }
@@ -59,6 +72,7 @@
         .kpis { grid-template-columns: minmax(0, 1fr); }
       }
     </style>
+    <script src="motion.js"></script>
   </head>
   <body>
     <div class="app" id="app">
@@ -93,6 +107,17 @@
               <div class="eq" id="eq"></div>
             </div>
           </div>
+        </section>
+
+        <section class="glass ai-card rise" style="--i:1" aria-labelledby="aiTitle">
+          <div class="ai-head">
+            <div>
+              <span class="label home-badge">Qwen</span>
+              <h2 class="panel-title" id="aiTitle">Аналитика нейросети</h2>
+            </div>
+            <button type="button" class="btn btn-sm btn-line" id="aiRefresh">Обновить анализ</button>
+          </div>
+          <div id="aiBody" aria-live="polite"></div>
         </section>
 
         <div id="analyticsBody"></div>
@@ -213,7 +238,34 @@
           }))
         }
 
+        /* ---------- Аналитика Qwen ---------- */
+
+        // Модель запускается при открытии страницы и по кнопке; сервер хранит ответ, пока данные
+        // не изменились, поэтому автообновление страницы её не дёргает.
+        const aiBody = document.getElementById('aiBody')
+        const aiRefresh = document.getElementById('aiRefresh')
+        const aiList = (title, items) => `<div class="ai-col"><span class="label">${title}</span>${
+          items.length ? `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : '<p class="ai-meta" style="margin-top:12px">Нет</p>'
+        }</div>`
+
+        async function loadInsight(refresh) {
+          aiRefresh.disabled = true
+          aiBody.innerHTML = '<div class="ai-wait"><span class="spinner"></span>Qwen анализирует статистику — это может занять до минуты…</div>'
+          try {
+            const insight = await UI.call(API.get('/analytics/ai' + (refresh ? '?refresh=1' : '')))
+            aiBody.innerHTML = `${insight.summary ? `<p class="ai-summary rise">${escapeHtml(insight.summary)}</p>` : ''}
+              <div class="ai-cols rise" style="--i:1">${aiList('Риски', insight.risks || [])}${aiList('Что сделать', insight.actions || [])}</div>
+              <div class="ai-meta">${escapeHtml(insight.model)} · анализ от ${formatDateTime(insight.generatedAt)}</div>`
+          } catch (error) {
+            aiBody.innerHTML = `<p class="ai-meta" style="font-size:13.5px">${escapeHtml(error.message || 'Не удалось получить анализ')}</p>`
+          } finally {
+            aiRefresh.disabled = false
+          }
+        }
+        aiRefresh.addEventListener('click', () => loadInsight(true))
+
         body.innerHTML = UI.loading()
+        loadInsight(false)
         render(false)
         UI.live(() => render(true))
       })()
