@@ -1,6 +1,9 @@
 package requestimport
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestFallbackSupplyReadsTemplateColumns(t *testing.T) {
 	document := FallbackSupply("Накладная № П-777 от 14.10.2026\nПродукт;Количество;Срок хранения (ч);Единица (г / мл / шт)\nМоцарелла;5;120;кг\nСливки 33 %;6000;96;мл\nЯйцо куриное;180;600;шт")
@@ -33,5 +36,19 @@ func TestFallbackSupplyWithoutShelfLife(t *testing.T) {
 	}
 	if document.Items[1].ProductName != "сахар" || document.Items[1].Quantity != 500 || document.Items[1].Unit != "g" {
 		t.Fatalf("unexpected second item: %#v", document.Items[1])
+	}
+}
+
+func TestInsightListsAcceptObjects(t *testing.T) {
+	var insight Insight
+	raw := `{"summary":"ok","new_dishes":[{"name":"Оливье","есть":"яйца","нет":"горошек"},"Глинтвейн"],"menu_picks":"Сырники — к чаю"}`
+	if err := json.Unmarshal([]byte(raw), &insight); err != nil {
+		t.Fatal(err)
+	}
+	if len(insight.NewDishes) != 2 || insight.NewDishes[0] != "Оливье — есть: яйца — нет: горошек" || insight.NewDishes[1] != "Глинтвейн" {
+		t.Fatalf("unexpected new dishes: %#v", insight.NewDishes)
+	}
+	if len(insight.MenuPicks) != 1 || insight.MenuPicks[0] != "Сырники — к чаю" {
+		t.Fatalf("unexpected menu picks: %#v", insight.MenuPicks)
 	}
 }

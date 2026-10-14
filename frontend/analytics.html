@@ -62,6 +62,8 @@
       .ai-col ul { margin: 12px 0 0; padding-left: 18px; display: grid; gap: 8px; font-size: 13.5px; line-height: 1.5; color: var(--ink); }
       .ai-meta { font-size: 12px; color: var(--ink-faint); }
       .ai-wait { display: flex; align-items: center; gap: 12px; font-size: 14px; color: var(--ink-soft); }
+      .ai-season { display: grid; gap: 12px; padding-top: 18px; border-top: 1px solid var(--line); }
+      .ai-season > .label { color: var(--ink); }
 
       @media (max-width: 900px) {
         .ai-cols { grid-template-columns: minmax(0, 1fr); }
@@ -255,6 +257,10 @@
             const insight = await UI.call(API.get('/analytics/ai' + (refresh ? '?refresh=1' : '')))
             aiBody.innerHTML = `${insight.summary ? `<p class="ai-summary rise">${escapeHtml(insight.summary)}</p>` : ''}
               <div class="ai-cols rise" style="--i:1">${aiList('Риски', insight.risks || [])}${aiList('Что сделать', insight.actions || [])}</div>
+              <div class="ai-season rise" style="--i:2">
+                <span class="label">Сезонное меню${insight.season ? ' · ' + escapeHtml(insight.season) : ''}</span>
+                <div class="ai-cols">${aiList('Выгодно продвигать из меню', insight.menuPicks || [])}${aiList('Стоит добавить в меню', insight.newDishes || [])}</div>
+              </div>
               <div class="ai-meta">${escapeHtml(insight.model)} · анализ от ${formatDateTime(insight.generatedAt)}</div>`
           } catch (error) {
             aiBody.innerHTML = `<p class="ai-meta" style="font-size:13.5px">${escapeHtml(error.message || 'Не удалось получить анализ')}</p>`

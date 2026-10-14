@@ -20,6 +20,9 @@ type analyticsInsightResponse struct {
 	Summary     string    `json:"summary"`
 	Risks       []string  `json:"risks"`
 	Actions     []string  `json:"actions"`
+	Season      string    `json:"season"`
+	MenuPicks   []string  `json:"menuPicks"` // блюда из меню, которые выгодно продвигать по сезону
+	NewDishes   []string  `json:"newDishes"` // сезонные блюда, которых в меню нет
 	Model       string    `json:"model"`
 	GeneratedAt time.Time `json:"generatedAt"`
 	Cached      bool      `json:"cached"`
@@ -49,7 +52,7 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 		a.sendJSON(w, http.StatusOK, cached)
 		return
 	}
-	facts, hasData, err := a.analyticsFacts(r)
+	facts, hasData, menuNames, err := a.analyticsFacts(r)
 	now, _ := a.nowAndSpeed()
 	requestMu.Unlock()
 	if err != nil {
@@ -72,8 +75,11 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	menuPicks := onlyMenuDishes(insight.MenuPicks, menuNames)
+	log.Printf("Аналитика Qwen: блюд из меню предложено %d, совпало с меню %d: %q", len(insight.MenuPicks), len(menuPicks), []string(insight.MenuPicks))
 	insightCache = analyticsInsightResponse{
 		Summary: insight.Summary, Risks: insight.Risks, Actions: insight.Actions,
+		Season: insight.Season, MenuPicks: menuPicks, NewDishes: insight.NewDishes,
 		Model: model, GeneratedAt: now,
 	}
 	insightRev = rev
@@ -82,19 +88,27 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 
 // analyticsFacts собирает статистику вкладки «Аналитика», склада и горячих предложений
 // и записывает её простыми строками по-русски — маленькой модели так проще не ошибиться в числах.
-func (a *API) analyticsFacts(r *http.Request) (string, bool, error) {
+func (a *API) analyticsFacts(r *http.Request) (string, bool, []string, error) {
 	var analytics contract.Analytics
 	if err := a.captureJSON(a.Analytics, r, &analytics); err != nil {
-		return "", false, err
+		return "", false, nil, err
 	}
 	var stock []contract.StockItem
 	if err := a.captureJSON(a.Stock, r, &stock); err != nil {
-		return "", false, err
+		return "", false, nil, err
+	}
+	var menu []contract.Dish
+	if err := a.captureJSON(a.Menu, r, &menu); err != nil {
+		return "", false, nil, err
 	}
 	now, _ := a.nowAndSpeed()
 	hot, err := a.computeHotOffers(now)
 	if err != nil {
-		return "", false, err
+		return "", false, nil, err
+	}
+	sales, err := a.dishSales(now)
+	if err != nil {
+		return "", false, nil, err
 	}
 	hasData := len(stock) > 0 || analytics.Orders.Accepted+analytics.Orders.Rejected > 0
 
@@ -103,7 +117,29 @@ func (a *API) analyticsFacts(r *http.Request) (string, bool, error) {
 	hours := func(at time.Time) string { return formatInsightHours(at.Sub(now).Hours()) }
 	limit := func(n int) int { return int(math.Min(float64(n), 10)) }
 
+	local := now.In(moscow())
+	line("Сегодня %s, сезон: %s.%s", local.Format("02.01.2006"), seasonName(local), upcomingHolidays(local))
+	line("Сезонные блюда, которые в это время года заказывают чаще: %s.", seasonalDishes(local))
 	line("Заказы: оформлено %d, отклонено из-за нехватки продуктов %d.", analytics.Orders.Accepted, analytics.Orders.Rejected)
+
+	line("\nМеню (порций продано: всего / в этом сезоне / за 7 дней; сколько можно приготовить из остатков):")
+	menuNames := make([]string, 0, len(menu))
+	if len(menu) == 0 {
+		line("- меню пустое")
+	}
+	for _, dish := range menu {
+		menuNames = append(menuNames, dish.Name)
+		parts := make([]string, 0, len(dish.Ingredients))
+		for _, ingredient := range dish.Ingredients {
+			parts = append(parts, ingredient.Name)
+		}
+		sold := sales[dish.DishID]
+		state := fmt.Sprintf("можно приготовить %d порц.", dish.AvailablePortions)
+		if dish.Stopped {
+			state = "в стоп-листе"
+		}
+		line("- %s (%s): продано %d / %d / %d; %s", dish.Name, strings.Join(parts, ", "), sold.Total, sold.Season, sold.Week, state)
+	}
 
 	line("\nОстатки на складе:")
 	if len(stock) == 0 {
@@ -180,7 +216,120 @@ func (a *API) analyticsFacts(r *http.Request) (string, bool, error) {
 	for _, item := range analytics.Deficits[:limit(len(analytics.Deficits))] {
 		line("- %s: не хватило %s, отказов %d", item.Name, formatInsightQty(item.Missing, item.Unit), item.Rejections)
 	}
-	return b.String(), hasData, nil
+	return b.String(), hasData, menuNames, nil
+}
+
+type dishSold struct{ Total, Season, Week int64 }
+
+// dishSales — сколько порций каждого блюда продано: всего, в текущем сезоне (те же месяцы любого года)
+// и за последние 7 дней по часам приложения.
+func (a *API) dishSales(now time.Time) (map[string]dishSold, error) {
+	rows, err := a.DB.Query("SELECT oi.dish_id,oi.portions,o.created_at FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.status='accepted'")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	season := seasonName(now.In(moscow()))
+	result := make(map[string]dishSold)
+	for rows.Next() {
+		var dishID, created string
+		var portions int64
+		if err := rows.Scan(&dishID, &portions, &created); err != nil {
+			return nil, err
+		}
+		at := parseTime(created)
+		item := result[dishID]
+		item.Total += portions
+		if seasonName(at.In(moscow())) == season {
+			item.Season += portions
+		}
+		if !at.After(now) && now.Sub(at) <= 7*24*time.Hour {
+			item.Week += portions
+		}
+		result[dishID] = item
+	}
+	return result, rows.Err()
+}
+
+func moscow() *time.Location {
+	if location, err := time.LoadLocation("Europe/Moscow"); err == nil {
+		return location
+	}
+	return time.FixedZone("MSK", 3*60*60)
+}
+
+func seasonName(at time.Time) string {
+	switch at.Month() {
+	case time.December, time.January, time.February:
+		return "зима"
+	case time.March, time.April, time.May:
+		return "весна"
+	case time.June, time.July, time.August:
+		return "лето"
+	default:
+		return "осень"
+	}
+}
+
+// seasonalDishes — подсказка модели: что в России чаще заказывают в этот сезон и перед праздниками.
+// Сервер даёт список только для текущего сезона, чтобы модель не советовала окрошку осенью.
+func seasonalDishes(at time.Time) string {
+	dishes := map[string]string{
+		"зима":  "оливье, селёдка под шубой, холодец, борщ, пельмени, глинтвейн, горячий шоколад, блюда с мандаринами",
+		"весна": "блины (Масленица), кулич и творожная пасха (Пасха), салаты с редисом и молодой зеленью, щавелевый суп, молодой картофель",
+		"лето":  "окрошка, свекольник и холодник, летние салаты из свежих овощей, шашлык, лимонады и холодный чай, мороженое и ягодные десерты",
+		"осень": "тыквенный суп и тыквенные десерты, грибной суп и жаркое с грибами, пироги с яблоками, рагу из овощей нового урожая, глинтвейн, кофе и какао со специями",
+	}
+	list := dishes[seasonName(at)]
+	if strings.Contains(upcomingHolidays(at), "Новый год") || strings.Contains(upcomingHolidays(at), "канун Нового года") {
+		list += "; к Новому году — оливье, мясная и сырная нарезка, салаты-закуски, мандарины, шампанское"
+	}
+	return list
+}
+
+// upcomingHolidays — праздники, до которых меньше 30 дней: под них стоит готовить меню заранее.
+func upcomingHolidays(at time.Time) string {
+	holidays := []struct {
+		month time.Month
+		day   int
+		name  string
+	}{
+		{time.January, 1, "Новый год"}, {time.January, 7, "Рождество"}, {time.February, 14, "День святого Валентина"},
+		{time.February, 23, "23 февраля"}, {time.March, 8, "8 марта"}, {time.May, 1, "1 мая"}, {time.May, 9, "День Победы"},
+		{time.June, 12, "День России"}, {time.September, 1, "1 сентября"}, {time.November, 4, "День народного единства"},
+		{time.December, 31, "канун Нового года"},
+	}
+	today := time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, at.Location())
+	found := make([]string, 0)
+	for _, holiday := range holidays {
+		date := time.Date(at.Year(), holiday.month, holiday.day, 0, 0, 0, 0, at.Location())
+		if date.Before(today) {
+			date = date.AddDate(1, 0, 0)
+		}
+		if days := int(date.Sub(today).Hours() / 24); days <= 30 {
+			found = append(found, fmt.Sprintf("%s через %d дн.", holiday.name, days))
+		}
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	return " Ближайшие праздники: " + strings.Join(found, ", ") + "."
+}
+
+// onlyMenuDishes оставляет рекомендации, в которых названо блюдо из меню: маленькая модель
+// иногда советует «из меню» то, чего в нём нет.
+func onlyMenuDishes(picks, menuNames []string) []string {
+	result := make([]string, 0, len(picks))
+	for _, pick := range picks {
+		normalized := strings.ToLower(pick)
+		for _, name := range menuNames {
+			if strings.Contains(normalized, strings.ToLower(name)) {
+				result = append(result, pick)
+				break
+			}
+		}
+	}
+	return result
 }
 
 // captureJSON вызывает обработчик API без сети и читает его JSON-ответ.
