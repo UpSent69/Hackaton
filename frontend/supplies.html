@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=20261015-14" />
+    <link rel="stylesheet" href="styles.css?v=20261015-16" />
     <style>
       /* Сцена страницы: конвейер, по которому едут ящики с поставкой */
       .belt { position: absolute; left: -8%; right: -8%; bottom: 34px; height: 2px; background: rgba(255, 255, 255, 0.28); }
@@ -48,7 +48,7 @@
       @keyframes rowOut { to { opacity: 0; transform: translateX(14px); } }
       tr.is-sub .item-list li { animation: rise 0.4s cubic-bezier(0.16, 1, 0.3, 1) both; animation-delay: calc(var(--i, 0) * 40ms); }
     </style>
-    <script src="motion.js?v=20261015-14"></script>
+    <script src="motion.js?v=20261015-16"></script>
   </head>
   <body>
     <div class="app" id="app">
@@ -60,7 +60,7 @@
               <span class="label home-badge">Приёмка</span>
               <h1 class="page-title">Поставки</h1>
               <p class="page-sub">Каждая строка поставки становится отдельной партией на складе со своим сроком годности.</p>
-              <p class="viewer-note label">Поставки создают администраторы и поставщики — вы рассматриваете поставки на проверке</p>
+              <p class="viewer-note label">Поставки создают владелец, директор и поставщик — вы рассматриваете поставки на проверке</p>
             </div>
             <div class="hero-stats">
               <div><div class="big" id="statSupplies">0</div><div class="small">поставок</div></div>
@@ -126,8 +126,8 @@
       </main>
     </div>
 
-    <script src="api.js?v=20261015-14"></script>
-        <script src="shared.js?v=20261015-14"></script>
+    <script src="api.js?v=20261015-16"></script>
+        <script src="shared.js?v=20261015-16"></script>
     <script>
       ;(() => {
         if (!UI.shell('supplies')) return

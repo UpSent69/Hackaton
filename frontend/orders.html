@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=20261015-14" />
+    <link rel="stylesheet" href="styles.css?v=20261015-16" />
     <style>
       /* Сцена страницы: тарелки, которые кружат вокруг «раздачи» */
       .pass { position: absolute; inset: 0; display: grid; place-items: center; }
@@ -60,7 +60,7 @@
       .done.is-on path { animation: draw 0.5s 0.1s ease forwards; }
       @keyframes draw { to { stroke-dashoffset: 0; } }
     </style>
-    <script src="motion.js?v=20261015-14"></script>
+    <script src="motion.js?v=20261015-16"></script>
   </head>
   <body>
     <div class="app" id="app">
@@ -72,7 +72,7 @@
               <span class="label home-badge">Касса</span>
               <h1 class="page-title">Заказы</h1>
               <p class="page-sub">Соберите заказ из блюд меню. При оформлении продукты списываются со склада, начиная с партий с самым ранним сроком.</p>
-              <p class="viewer-note label">Режим просмотра — изменять данные могут только администраторы</p>
+              <p class="viewer-note label">Режим просмотра — изменять данные могут владелец и директор ресторана</p>
             </div>
             <div class="hero-stats">
               <div><div class="big" id="statAccepted">0</div><div class="small">заказов оформлено</div></div>
@@ -103,8 +103,8 @@
       </main>
     </div>
 
-    <script src="api.js?v=20261015-14"></script>
-        <script src="shared.js?v=20261015-14"></script>
+    <script src="api.js?v=20261015-16"></script>
+        <script src="shared.js?v=20261015-16"></script>
     <script>
       ;(() => {
         if (!UI.shell('orders')) return

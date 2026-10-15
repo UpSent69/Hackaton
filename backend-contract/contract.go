@@ -370,12 +370,31 @@ type Pulse struct {
 // HotOffer — блюдо, продажу которого стоит стимулировать. Список отсортирован по Score по убыванию;
 // блюда в стопе в него не входят.
 type HotOffer struct {
+	// ID — «auto-…» у рассчитанных предложений, «manual-N» у добавленных вручную.
+	ID     string `json:"id"`
+	Source string `json:"source"` // auto | manual
+	// Status у ручных: pending (ждёт менеджера), active, rejected; у автоматических всегда active.
+	Status string `json:"status"`
+	// Hidden — скрыто менеджером: официант такое предложение не видит, остальные — полупрозрачным.
+	Hidden    bool   `json:"hidden"`
+	Note      string `json:"note,omitempty"`      // причина ручного предложения
+	CreatedBy string `json:"createdBy,omitempty"` // кто добавил ручное предложение
+
 	DishID            string      `json:"dishId"`
 	Name              string      `json:"name"`
 	Score             int         `json:"score"` // приоритет 0…100
 	AvailablePortions int64       `json:"availablePortions"`
 	Target            HotTarget   `json:"target"`
 	Reasons           []HotReason `json:"reasons"` // по убыванию Weight, первая — главная
+}
+
+// CreateHotOfferRequest — ручное горячее предложение. Официант создаёт его на рассмотрение
+// менеджеру; менеджер, директор и владелец — сразу действующим.
+type CreateHotOfferRequest struct {
+	DishID   string    `json:"dishId"`
+	Reason   string    `json:"reason"`   // до 300 символов
+	Portions int64     `json:"portions"` // цель: сколько порций продать, 1…10000
+	Until    time.Time `json:"until"`    // до какого времени действует (не дальше 7 суток)
 }
 
 type HotTarget struct {

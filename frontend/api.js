@@ -198,7 +198,9 @@ const API = (() => {
 ;(() => {
   const home = API.roleHome()
   const page = location.pathname.split('/').pop() || 'index.html'
-  if (home && page !== home && page !== 'login.html') location.replace(home)
+  // Официанту, кроме «Заказов», открыта вкладка «Горячее» (app.html#/hot-offers).
+  const waiterHot = (API.getUser() || {}).role === 'waiter' && page === 'app.html' && /^#\/hot-offers/.test(location.hash)
+  if (home && page !== home && page !== 'login.html' && !waiterHot) location.replace(home)
   // Владелец сначала выбирает ресторан: без него страницам ресторана нечего показать.
   const user = API.getUser()
   const choosing = page === 'app.html' && /^#\/(restaurants|admin)/.test(location.hash)

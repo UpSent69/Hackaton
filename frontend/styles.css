@@ -547,7 +547,15 @@ select.input:disabled { opacity: 0.6; cursor: default; }
 .hot-head h3 { font-size: 22px; font-weight: 500; letter-spacing: -0.04em; color: var(--ink); }
 .hot-why { margin-top: 12px; font-size: 14.5px; line-height: 1.55; color: var(--ink); max-width: 70ch; }
 .hot-also { margin-top: 8px; font-size: 13px; line-height: 1.5; color: var(--ink-soft); max-width: 70ch; }
-.hot-score { display: grid; gap: 8px; justify-items: end; text-align: right; }
+.hot-score { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; text-align: right; align-self: stretch; }
+/* «Скрыть» и «Удалить» — маленькие кнопки в правом нижнем углу карточки */
+.hot-actions { margin-top: auto; padding-top: 12px; display: flex; gap: 6px; }
+.hot-actions .icon-btn { width: 32px; height: 32px; }
+.hot-actions .icon-btn svg { width: 16px; height: 16px; }
+/* Скрытое от официантов предложение — полупрозрачное */
+.hot.is-hidden { opacity: 0.45; }
+.hot.is-hidden:hover { opacity: 0.7; }
+.hot-review { display: flex; gap: 8px; margin-top: auto; padding-top: 12px; }
 .hot-score .score-track { width: 100%; }
 .score-track { height: 4px; min-width: 70px; border-radius: 2px; background: rgba(255, 255, 255, 0.1); overflow: hidden; }
 .score-track i { display: block; height: 100%; border-radius: 2px; background: #fff; }
@@ -674,7 +682,7 @@ select.input:disabled { opacity: 0.6; cursor: default; }
   .cart { position: static; }
   .stop-summary { grid-template-columns: minmax(0, 1fr); }
   .hot { grid-template-columns: minmax(0, 1fr); }
-  .hot-score { justify-items: start; text-align: left; }
+  .hot-score { align-items: flex-start; text-align: left; }
   .feed li { grid-template-columns: auto minmax(0, 1fr); }
   .feed time { grid-column: 2; }
   .auth-art { display: none; }

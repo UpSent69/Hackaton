@@ -286,7 +286,7 @@
 
     const canSave = admin && items.length > 0 && !missingDish && !missingPrice && !invalidPortions && !duplicateSaved
     saveButton.disabled = !canSave
-    if (!admin) message(saveMessage, 'Сохранять заявки и менять цены может только администратор.', true)
+    if (!admin) message(saveMessage, 'Сохранять заявки и менять цены могут владелец и директор ресторана.', true)
     else if (duplicateSaved) message(saveMessage, 'Этот исходный файл уже сохранён. Загрузи другой файл или создай заявку вручную.', true)
     else if (missingDish) message(saveMessage, 'Для каждой позиции выбери блюдо из меню. Если его нет — добавь блюдо во вкладке «Меню» или удали строку.', true)
     else if (missingPrice) message(saveMessage, 'Для блюда без цены порции введи цену вручную. Она сохранится только в этой заявке.', true)
@@ -507,7 +507,7 @@
   el('refreshRequests').addEventListener('click', loadHistory)
 
   async function init() {
-    if (!admin) updateAIStatus('Режим просмотра', 'Заявки и цены может изменять администратор.', true)
+    if (!admin) updateAIStatus('Режим просмотра', 'Заявки и цены могут изменять владелец и директор ресторана.', true)
     await Promise.all([loadMenu(), loadHistory()])
   }
 

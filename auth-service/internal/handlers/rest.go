@@ -111,7 +111,12 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("GET", "/api/orders", false, a.Orders, waiter)
 
 	authed("GET", "/api/pulse", false, a.Pulse, waiter, supplier)
-	authed("GET", "/api/hot-offers", false, a.cachedJSON("hot-offers", a.HotOffers))
+	// Ответ зависит от роли (официант не видит скрытые), поэтому не кэшируется.
+	authed("GET", "/api/hot-offers", false, a.HotOffers, waiter)
+	authed("POST", "/api/hot-offers", true, a.CreateHotOffer, contract.RoleManager, waiter)
+	authed("POST", "/api/hot-offers/{id}/review", true, a.ReviewHotOffer, contract.RoleManager)
+	authed("POST", "/api/hot-offers/{id}/hide", true, a.HideHotOffer, contract.RoleManager)
+	authed("DELETE", "/api/hot-offers/{id}", true, a.DeleteHotOffer, contract.RoleManager)
 	authed("GET", "/api/analytics", false, a.cachedJSON("analytics", a.Analytics))
 	mux.Handle("GET /api/analytics/ai", a.protectLongRunning(false, a.AnalyticsInsight))
 	// Результаты распознавания и анализа приходят из ai-service через Kafka.

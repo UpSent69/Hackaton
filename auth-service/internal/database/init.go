@@ -167,6 +167,20 @@ func Init(dbPath string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate restaurants: %w", err)
 	}
+	// Горячие предложения, добавленные вручную, и решения «скрыть / удалить» по рассчитанным.
+	if _, err := db.Exec(
+		"CREATE TABLE IF NOT EXISTS hot_offers_manual (" +
+			"id INTEGER PRIMARY KEY AUTOINCREMENT, restaurant_id INTEGER NOT NULL REFERENCES restaurants(id), " +
+			"dish_id INTEGER NOT NULL REFERENCES dishes(id) ON DELETE CASCADE, reason TEXT NOT NULL, " +
+			"target_portions INTEGER NOT NULL, until TEXT NOT NULL, status TEXT NOT NULL, hidden INTEGER NOT NULL DEFAULT 0, " +
+			"created_by INTEGER NULL, created_at TEXT NOT NULL, reviewed_at TEXT NULL);" +
+			"CREATE TABLE IF NOT EXISTS hot_offer_overrides (" +
+			"restaurant_id INTEGER NOT NULL, offer_id TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('hidden','deleted')), " +
+			"created_at TEXT NOT NULL, PRIMARY KEY(restaurant_id, offer_id));",
+	); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate hot offers: %w", err)
+	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err = db.Exec(

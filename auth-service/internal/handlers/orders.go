@@ -131,7 +131,7 @@ func (a *API) Menu(w http.ResponseWriter, r *http.Request) {
 		}
 		menu = append(menu, dish)
 	}
-	offers, err := a.computeHotOffers(restaurantOf(r), now)
+	offers, err := a.activeHotOffers(restaurantOf(r), now)
 	if err == nil {
 		scores := make(map[string]int, len(offers))
 		for _, offer := range offers {

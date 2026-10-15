@@ -51,7 +51,7 @@
     `<svg class="chev${open ? ' is-open' : ''}" viewBox="0 0 12 12" aria-hidden="true"><path d="M4 2l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`
 
   const pageHeader = (title, description) =>
-    `<div class="page-head"><h1 class="page-title">${escapeHtml(title)}</h1>${description ? `<p class="page-sub">${escapeHtml(description)}</p>` : ''}<p class="viewer-note label">Режим просмотра — изменять данные могут только администраторы</p></div>`
+    `<div class="page-head"><h1 class="page-title">${escapeHtml(title)}</h1>${description ? `<p class="page-sub">${escapeHtml(description)}</p>` : ''}<p class="viewer-note label">Режим просмотра — изменять данные могут владелец и директор ресторана</p></div>`
 
   const loading = () => '<div class="empty"><span class="spinner" aria-label="Загрузка"></span></div>'
 
@@ -128,7 +128,8 @@
 
   function renderNav(current) {
     const user = API.getUser()
-    const links = NAV.map(([path, label, page]) => `<a href="${page || '#/' + path}"${path === current ? ' class="active"' : ''}>${label}</a>`).join('') +
+    const waiterTabs = user && user.role === 'waiter' ? ['orders', 'hot-offers'] : null
+    const links = NAV.filter(([path]) => !waiterTabs || waiterTabs.includes(path)).map(([path, label, page]) => `<a href="${page || '#/' + path}"${path === current ? ' class="active"' : ''}>${label}</a>`).join('') +
       (user ? '' : `<a href="#/register"${current === 'register' ? ' class="active"' : ''}>Зарегистрироваться</a>`)
     document.getElementById('navLinks').innerHTML = links
     const admin = isAdmin()
@@ -217,7 +218,7 @@
               ${
                 isRegister
                   ? `Уже есть аккаунт? <a href="login.html?next=${encodeURIComponent(next)}">Войти</a>`
-                  : `<span id="registerHint">Нет аккаунта? Его выдаёт администратор.</span>`
+                  : `<span id="registerHint">Нет аккаунта? Его выдаёт владелец или директор ресторана.</span>`
               }
             </p>
           </div>
@@ -241,7 +242,7 @@
         const hint = document.getElementById('registerHint')
         if (hint && state.open) hint.innerHTML = `Нет аккаунта? <a href="#/register?next=${encodeURIComponent(next)}">Зарегистрироваться</a>`
         if (isRegister && !state.open && document.body.contains(form)) {
-          form.outerHTML = '<div class="glass empty" style="margin-top:24px"><h3>Регистрация закрыта</h3><p>Администраторы уже назначены. Аккаунт менеджера выдаёт администратор.</p></div>'
+          form.outerHTML = '<div class="glass empty" style="margin-top:24px"><h3>Регистрация закрыта</h3><p>Владельцы уже зарегистрированы. Аккаунты сотрудников выдают владелец и директор ресторана на странице «Администрирование».</p></div>'
         }
       })
       .catch(() => {})
@@ -785,9 +786,37 @@
     return parts.join(' ')
   }
 
+  // Иконки кнопок карточки: урна, перечёркнутый глаз (скрыть), глаз (показать снова).
+  const HOT_ICON = {
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>',
+    eyeOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>',
+    eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+  }
+
+  // «2026-10-15T21:27» для поля datetime-local по часам сервера (в демо они могут идти быстрее).
+  const localInput = (ms) => {
+    const date = new Date(ms)
+    const pad = (n) => String(n).padStart(2, '0')
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  }
+
   async function hotView(silent) {
+    const me = API.getUser() || {}
+    // Официант предлагает на рассмотрение; менеджер, директор и владелец добавляют сразу,
+    // рассматривают предложения официантов, скрывают и удаляют предложения.
+    const staff = me.role !== 'waiter'
     if (!silent) {
-      view.innerHTML = `<main class="page">${pageHeader('Горячие предложения', 'Блюда, продажу которых стоит стимулировать: в них идут продукты, которые иначе не успеют израсходоваться до конца срока.')}<div id="hotBody">${loading()}</div></main>`
+      view.innerHTML = `<main class="page">${pageHeader('Горячие предложения', 'Блюда, продажу которых стоит стимулировать: в них идут продукты, которые иначе не успеют израсходоваться до конца срока.')}
+        <div class="form-foot" style="margin-bottom:20px">
+          <button type="button" class="btn btn-solid" id="hotAddBtn">Добавить горячее предложение</button>
+          <span class="form-msg" id="hotMsg" role="status"></span>
+        </div>
+        <div id="hotFormWrap"></div>
+        <div id="hotBody">${loading()}</div>
+      </main>`
+      view.querySelector('.viewer-note')?.remove()
+      document.getElementById('hotAddBtn').addEventListener('click', openHotForm)
+      document.getElementById('hotBody').addEventListener('click', hotAction)
     }
     const body = document.getElementById('hotBody')
     if (!body) return
@@ -801,34 +830,159 @@
     }
     if (!document.body.contains(body)) return
 
-    if (offers.length === 0) {
-      body.innerHTML = `<div class="glass empty"><h3>Горячих предложений нет</h3><p>Продукты успевают расходоваться до конца срока. Список обновится сам, когда какая-то партия начнёт истекать.</p></div>`
-      return
+    const active = offers.filter((offer) => offer.status === 'active')
+    const pending = offers.filter((offer) => offer.status === 'pending')
+    const rejected = offers.filter((offer) => offer.status === 'rejected')
+
+    const card = (offer, index) => {
+      const manual = offer.source === 'manual'
+      return `<article class="glass hot${offer.hidden ? ' is-hidden' : ''}" data-offer="${escapeHtml(offer.id)}" data-name="${escapeHtml(offer.name)}">
+        <div class="hot-rank">${index + 1}</div>
+        <div class="hot-main">
+          <div class="hot-head">
+            <h3>${escapeHtml(offer.name)}</h3>
+            <span class="label tag" style="margin:0">Цель: ${portionsLabel(offer.target.portions)} до ${formatDateTime(offer.target.until)}</span>
+          </div>
+          ${manual
+            ? `<p class="hot-why">${escapeHtml(offer.note)}</p>
+               <p class="hot-also">Добавлено вручную${offer.createdBy ? ': ' + escapeHtml(offer.createdBy) : ''}${offer.hidden ? ' · скрыто от официантов' : ''}</p>`
+            : `<p class="hot-why">${reasonText(offer.reasons[0])}</p>
+               ${offer.reasons.slice(1).map((reason) => `<p class="hot-also">Заодно: ${reasonText(reason)}</p>`).join('')}
+               ${offer.hidden ? '<p class="hot-also">Скрыто от официантов</p>' : ''}`}
+        </div>
+        <div class="hot-score" title="${manual ? 'Добавлено вручную' : 'Приоритет: срочность × покрытие × эксклюзивность'}">
+          ${manual ? '<div class="small">вручную</div>' : `<div class="big">${offer.score}</div>
+          <div class="score-track"><i style="width:${offer.score}%"></i></div>
+          <div class="small">приоритет</div>`}
+          ${staff ? `<div class="hot-actions">
+            <button type="button" class="icon-btn" data-hot-hide="${offer.hidden ? 'false' : 'true'}" title="${offer.hidden ? 'Показать официантам' : 'Скрыть от официантов'}" aria-label="${offer.hidden ? 'Показать' : 'Скрыть'}">${offer.hidden ? HOT_ICON.eye : HOT_ICON.eyeOff}</button>
+            <button type="button" class="icon-btn" data-hot-delete title="Удалить" aria-label="Удалить">${HOT_ICON.trash}</button>
+          </div>` : ''}
+        </div>
+      </article>`
     }
 
-    body.innerHTML = `<div class="hot-list">
-      ${offers
-        .map(
-          (offer, index) => `<article class="glass hot">
-            <div class="hot-rank">${index + 1}</div>
-            <div class="hot-main">
-              <div class="hot-head">
-                <h3>${escapeHtml(offer.name)}</h3>
-                <span class="label tag" style="margin:0">Цель: ${portionsLabel(offer.target.portions)} до ${formatDateTime(offer.target.until)}</span>
-              </div>
-              <p class="hot-why">${reasonText(offer.reasons[0])}</p>
-              ${offer.reasons.slice(1).map((reason) => `<p class="hot-also">Заодно: ${reasonText(reason)}</p>`).join('')}
-            </div>
-            <div class="hot-score" title="Приоритет: срочность × покрытие × эксклюзивность">
-              <div class="big">${offer.score}</div>
-              <div class="score-track"><i style="width:${offer.score}%"></i></div>
-              <div class="small">приоритет</div>
-            </div>
-          </article>`,
-        )
-        .join('')}
-    </div>
-    <p class="page-sub" style="margin-top:20px">Приоритет тем выше, чем ближе срок партии, чем большую долю остатка под риском блюдо способно израсходовать и чем меньше других блюд используют этот продукт.</p>`
+    // Предложения официантов: менеджер, директор и владелец одобряют или отклоняют,
+    // официант видит, что его предложение ждёт решения или отклонено.
+    const proposal = (offer) => `<article class="glass hot" data-offer="${escapeHtml(offer.id)}" data-name="${escapeHtml(offer.name)}">
+        <div class="hot-rank">·</div>
+        <div class="hot-main">
+          <div class="hot-head">
+            <h3>${escapeHtml(offer.name)}</h3>
+            <span class="label tag" style="margin:0">Цель: ${portionsLabel(offer.target.portions)} до ${formatDateTime(offer.target.until)}</span>
+          </div>
+          <p class="hot-why">${escapeHtml(offer.note)}</p>
+          <p class="hot-also">${staff ? 'Предложил официант' + (offer.createdBy ? ' ' + escapeHtml(offer.createdBy) : '') : offer.status === 'rejected' ? 'Менеджер отклонил предложение' : 'Ждёт решения менеджера'}</p>
+        </div>
+        <div class="hot-score">
+          ${staff
+            ? `<div class="hot-review"><button type="button" class="btn btn-sm btn-solid" data-hot-review="approve">Одобрить</button><button type="button" class="btn btn-sm btn-line" data-hot-review="reject">Отклонить</button></div>`
+            : `<div class="small">${offer.status === 'rejected' ? 'отклонено' : 'на рассмотрении'}</div>`}
+        </div>
+      </article>`
+
+    const sections = []
+    const waiting = staff ? pending : pending.concat(rejected)
+    if (waiting.length) {
+      sections.push(`<h2 class="panel-title" style="margin:0 0 12px">${staff ? 'На рассмотрении' : 'Мои предложения'}</h2>
+        <div class="hot-list" style="margin-bottom:28px">${waiting.map(proposal).join('')}</div>`)
+    }
+    if (active.length === 0) {
+      sections.push(`<div class="glass empty"><h3>Горячих предложений нет</h3><p>Продукты успевают расходоваться до конца срока. Список обновится сам, когда какая-то партия начнёт истекать, — или добавьте предложение вручную.</p></div>`)
+    } else {
+      sections.push(`<div class="hot-list">${active.map(card).join('')}</div>
+        <p class="page-sub" style="margin-top:20px">Приоритет тем выше, чем ближе срок партии, чем большую долю остатка под риском блюдо способно израсходовать и чем меньше других блюд используют этот продукт.</p>`)
+    }
+    body.innerHTML = sections.join('')
+  }
+
+  // Форма ручного предложения: блюдо из меню ресторана, причина, цель и срок.
+  async function openHotForm() {
+    const wrap = document.getElementById('hotFormWrap')
+    if (wrap.firstElementChild) {
+      wrap.innerHTML = ''
+      return
+    }
+    const menu = await call(API.get('/menu')).catch(() => [])
+    const staff = (API.getUser() || {}).role !== 'waiter'
+    wrap.innerHTML = `<form class="glass form" id="hotForm" novalidate style="margin-bottom:24px">
+      <h2 class="panel-title">Новое горячее предложение</h2>
+      <div class="supply-row" style="grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.5fr) minmax(0, 0.8fr)">
+        <label class="field"><span class="label">Блюдо</span><select class="input" name="dishId">
+          <option value="">Выберите блюдо из меню</option>
+          ${menu.map((dish) => `<option value="${escapeHtml(dish.dishId)}">${escapeHtml(dish.name)}</option>`).join('')}
+        </select></label>
+        <label class="field"><span class="label">Цель, порций</span><input class="input" name="portions" type="number" min="1" max="10000" value="5" /></label>
+        <label class="field"><span class="label">Действует до</span><input class="input" name="until" type="datetime-local" value="${localInput(API.now() + 4 * 3600 * 1000)}" /></label>
+      </div>
+      <label class="field" style="margin-top:12px"><span class="label">Причина</span>
+        <input class="input" name="reason" maxlength="300" placeholder="Например: много томатов, срок подходит" autocomplete="off" /></label>
+      <div class="form-foot">
+        <button type="submit" class="btn btn-solid">${staff ? 'Добавить' : 'Отправить менеджеру'}</button>
+        <button type="button" class="btn btn-line" data-hot-cancel>Отмена</button>
+        <span class="form-msg" role="status"></span>
+      </div>
+    </form>`
+    const form = document.getElementById('hotForm')
+    const message = form.querySelector('.form-msg')
+    form.querySelector('[data-hot-cancel]').addEventListener('click', () => (wrap.innerHTML = ''))
+    form.addEventListener('input', (event) => event.target.classList.remove('is-invalid'))
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault()
+      const data = Object.fromEntries(new FormData(form))
+      const until = new Date(data.until)
+      const bad = {
+        dishId: !data.dishId,
+        portions: !(Number(data.portions) >= 1),
+        until: Number.isNaN(until.getTime()) || until.getTime() <= API.now(),
+        reason: !data.reason.trim(),
+      }
+      Object.entries(bad).forEach(([name, value]) => form.elements[name].classList.toggle('is-invalid', value))
+      if (Object.values(bad).some(Boolean)) {
+        setMessage(message, 'Выберите блюдо, напишите причину, цель и срок в будущем', true)
+        return
+      }
+      const submit = form.querySelector('[type=submit]')
+      submit.disabled = true
+      try {
+        const result = await call(API.post('/hot-offers', { dishId: data.dishId, reason: data.reason.trim(), portions: Number(data.portions), until: until.toISOString() }))
+        wrap.innerHTML = ''
+        setMessage(document.getElementById('hotMsg'), result.status === 'pending' ? 'Предложение отправлено менеджеру на рассмотрение' : 'Горячее предложение добавлено')
+        hotView(true)
+      } catch (error) {
+        setMessage(message, error.message, true)
+        submit.disabled = false
+      }
+    })
+  }
+
+  // Кнопки на карточках: скрыть / показать, удалить, одобрить / отклонить.
+  async function hotAction(event) {
+    const button = event.target.closest('[data-hot-hide], [data-hot-delete], [data-hot-review]')
+    if (!button) return
+    const card = button.closest('[data-offer]')
+    const id = encodeURIComponent(card.dataset.offer)
+    const message = document.getElementById('hotMsg')
+    if (button.hasAttribute('data-hot-delete') && !window.confirm(`Удалить горячее предложение «${card.dataset.name}»?`)) return
+    button.disabled = true
+    try {
+      if (button.hasAttribute('data-hot-delete')) {
+        await call(API.del('/hot-offers/' + id))
+        setMessage(message, `Предложение «${card.dataset.name}» удалено`)
+      } else if (button.hasAttribute('data-hot-review')) {
+        const approve = button.dataset.hotReview === 'approve'
+        await call(API.post('/hot-offers/' + id + '/review', { action: button.dataset.hotReview }))
+        setMessage(message, `Предложение «${card.dataset.name}» ${approve ? 'одобрено' : 'отклонено'}`)
+      } else {
+        const hidden = button.dataset.hotHide === 'true'
+        await call(API.post('/hot-offers/' + id + '/hide', { hidden }))
+        setMessage(message, `Предложение «${card.dataset.name}» ${hidden ? 'скрыто от официантов' : 'снова видно официантам'}`)
+      }
+      await hotView(true)
+    } catch (error) {
+      setMessage(message, error.message, true)
+      button.disabled = false
+    }
   }
 
   /* ---------- Демо: ускорение времени и генератор событий ---------- */
@@ -1048,6 +1202,11 @@
     // Главная и вход — отдельные страницы.
     if (path === '') {
       location.replace('index.html')
+      return
+    }
+    // Официанту из экранов этой страницы доступно только «Горячее».
+    if ((API.getUser() || {}).role === 'waiter' && !['hot-offers', 'login', 'register'].includes(path) && !PAGES[path]) {
+      location.replace('orders.html')
       return
     }
     // Владелец сначала выбирает ресторан.

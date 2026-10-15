@@ -2,8 +2,11 @@ package handlers
 
 import (
 	"auth-service/internal/contract"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"sort"
@@ -263,6 +266,8 @@ func clearOperationalData(tx *sql.Tx, restaurantID int64) error {
 		"DELETE FROM supplies WHERE restaurant_id=?",
 		"DELETE FROM products WHERE restaurant_id=? AND id NOT IN (SELECT product_id FROM batches)",
 		"DELETE FROM alerts WHERE restaurant_id=?",
+		"DELETE FROM hot_offers_manual WHERE restaurant_id=?",
+		"DELETE FROM hot_offer_overrides WHERE restaurant_id=?",
 	} {
 		if _, err := tx.Exec(statement, restaurantID); err != nil {
 			return err
@@ -574,14 +579,306 @@ func (a *API) computeHotOffers(restaurantID int64, now time.Time) ([]contract.Ho
 	return result, nil
 }
 
+// HotOffers — горячие предложения ресторана: рассчитанные и добавленные вручную.
+// Официант не видит скрытые; менеджер, директор и владелец видят их с пометкой hidden
+// и предложения, ждущие рассмотрения.
 func (a *API) HotOffers(w http.ResponseWriter, r *http.Request) {
 	now, _ := a.nowAndSpeed()
-	offers, err := a.computeHotOffers(restaurantOf(r), now)
+	offers, err := a.visibleHotOffers(restaurantOf(r), now, currentAuth(r).User)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать горячие предложения")
 		return
 	}
 	a.sendJSON(w, http.StatusOK, offers)
+}
+
+// autoOfferID — устойчивый id рассчитанного предложения: блюдо и главная партия. Удалённое
+// предложение не вернётся, пока причина та же; новая партия даст новое предложение.
+func autoOfferID(offer contract.HotOffer) string {
+	key := offer.DishID
+	if len(offer.Reasons) > 0 {
+		key += "|" + offer.Reasons[0].ProductID + "|" + offer.Reasons[0].SupplyNumber
+	}
+	sum := sha1.Sum([]byte(key))
+	return "auto-" + hex.EncodeToString(sum[:8])
+}
+
+// visibleHotOffers собирает предложения для пользователя: сначала ручные, затем рассчитанные.
+func (a *API) visibleHotOffers(restaurantID int64, now time.Time, viewer contract.User) ([]contract.HotOffer, error) {
+	staff := viewer.Role != contract.RoleWaiter
+	result, err := a.manualHotOffers(restaurantID, now, viewer)
+	if err != nil {
+		return nil, err
+	}
+	auto, err := a.computeHotOffers(restaurantID, now)
+	if err != nil {
+		return nil, err
+	}
+	overrides := make(map[string]string)
+	rows, err := a.DB.Query("SELECT offer_id,action FROM hot_offer_overrides WHERE restaurant_id=?", restaurantID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id, action string
+		if err := rows.Scan(&id, &action); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		overrides[id] = action
+	}
+	rows.Close()
+	for _, offer := range auto {
+		offer.ID, offer.Source, offer.Status = autoOfferID(offer), "auto", "active"
+		switch overrides[offer.ID] {
+		case "deleted":
+			continue
+		case "hidden":
+			if !staff {
+				continue
+			}
+			offer.Hidden = true
+		}
+		result = append(result, offer)
+	}
+	return result, nil
+}
+
+// activeHotOffers — то, что видно официанту как действующее: без скрытых и без ждущих решения.
+// По ним меню отмечает блюда «горячими».
+func (a *API) activeHotOffers(restaurantID int64, now time.Time) ([]contract.HotOffer, error) {
+	offers, err := a.visibleHotOffers(restaurantID, now, contract.User{Role: contract.RoleWaiter})
+	if err != nil {
+		return nil, err
+	}
+	active := offers[:0]
+	for _, offer := range offers {
+		if offer.Status == "active" && !offer.Hidden {
+			active = append(active, offer)
+		}
+	}
+	return active, nil
+}
+
+// manualHotOffers — ручные предложения ресторана, которые ещё действуют. Официант видит
+// действующие (кроме скрытых) и свои — на рассмотрении или отклонённые за последние сутки.
+func (a *API) manualHotOffers(restaurantID int64, now time.Time, viewer contract.User) ([]contract.HotOffer, error) {
+	rows, err := a.DB.Query(
+		"SELECT h.id,h.dish_id,h.reason,h.target_portions,h.until,h.status,h.hidden,COALESCE(h.created_by,0),COALESCE(ac.name,''),COALESCE(h.reviewed_at,'') "+
+			"FROM hot_offers_manual h LEFT JOIN accounts ac ON ac.id=h.created_by WHERE h.restaurant_id=? ORDER BY h.until,h.id",
+		restaurantID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	type manualRow struct {
+		ID, DishID, Portions, CreatedByID int64
+		Reason, Until, Status, CreatedBy  string
+		Reviewed                          string
+		Hidden                            bool
+	}
+	list := make([]manualRow, 0)
+	for rows.Next() {
+		var row manualRow
+		if err := rows.Scan(&row.ID, &row.DishID, &row.Reason, &row.Portions, &row.Until, &row.Status, &row.Hidden, &row.CreatedByID, &row.CreatedBy, &row.Reviewed); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		list = append(list, row)
+	}
+	rows.Close()
+
+	staff := viewer.Role != contract.RoleWaiter
+	own := func(row manualRow) bool { return strconv.FormatInt(row.CreatedByID, 10) == viewer.ID }
+	result := make([]contract.HotOffer, 0)
+	for _, row := range list {
+		until := parseTime(row.Until)
+		if !now.Before(until) {
+			continue
+		}
+		switch row.Status {
+		case "active":
+			if row.Hidden && !staff {
+				continue
+			}
+		case "pending":
+			if !staff && !own(row) {
+				continue
+			}
+		case "rejected":
+			if !own(row) || now.Sub(parseTime(row.Reviewed)) > 24*time.Hour {
+				continue
+			}
+		default:
+			continue
+		}
+		dish, err := a.buildDish(row.DishID, now)
+		if err != nil {
+			continue
+		}
+		result = append(result, contract.HotOffer{
+			ID: "manual-" + strconv.FormatInt(row.ID, 10), Source: "manual", Status: row.Status, Hidden: row.Hidden,
+			Note: row.Reason, CreatedBy: row.CreatedBy,
+			DishID: dish.DishID, Name: dish.Name, Score: 100, AvailablePortions: dish.AvailablePortions,
+			Target:  contract.HotTarget{Portions: row.Portions, Until: until},
+			Reasons: []contract.HotReason{},
+		})
+	}
+	return result, nil
+}
+
+// CreateHotOffer — ручное горячее предложение: от официанта — на рассмотрение менеджеру,
+// от менеджера, директора и владельца — сразу действующее.
+func (a *API) CreateHotOffer(w http.ResponseWriter, r *http.Request) {
+	auth := currentAuth(r)
+	restaurantID := restaurantOf(r)
+	var req contract.CreateHotOfferRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		a.writeError(w, http.StatusBadRequest, "Проверьте блюдо, причину, цель и срок")
+		return
+	}
+	req.Reason = strings.TrimSpace(req.Reason)
+	if req.Reason == "" || len([]rune(req.Reason)) > 300 {
+		a.writeError(w, http.StatusBadRequest, "Напишите причину — до 300 символов")
+		return
+	}
+	if req.Portions < 1 || req.Portions > 10000 {
+		a.writeError(w, http.StatusBadRequest, "Цель — от 1 до 10 000 порций")
+		return
+	}
+	now, _ := a.nowAndSpeed()
+	if !req.Until.After(now) || req.Until.After(now.Add(7*24*time.Hour)) {
+		a.writeError(w, http.StatusBadRequest, "Срок — в будущем и не дальше 7 суток")
+		return
+	}
+	dishID, err := parseID(req.DishID)
+	var dishName string
+	if err != nil || a.DB.QueryRow("SELECT name FROM dishes WHERE id=? AND restaurant_id=?", dishID, restaurantID).Scan(&dishName) != nil {
+		a.writeError(w, http.StatusBadRequest, "Выберите блюдо из меню ресторана")
+		return
+	}
+	status := "active"
+	if auth.User.Role == contract.RoleWaiter {
+		status = "pending"
+	}
+	if _, err := a.DB.Exec(
+		"INSERT INTO hot_offers_manual(restaurant_id,dish_id,reason,target_portions,until,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+		restaurantID, dishID, req.Reason, req.Portions, formatTime(req.Until.UTC()), status, auth.User.ID, formatTime(now),
+	); err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить горячее предложение")
+		return
+	}
+	if status == "pending" {
+		a.addAlert(restaurantID, contract.AlertLevel("warning"), fmt.Sprintf("Официант %s предложил горячее предложение «%s» — рассмотрите его.", auth.User.Name, dishName), now)
+	}
+	a.bumpRev()
+	a.sendJSON(w, http.StatusCreated, map[string]string{"status": status})
+}
+
+// manualOfferID разбирает «manual-N».
+func manualOfferID(id string) (int64, bool) {
+	if !strings.HasPrefix(id, "manual-") {
+		return 0, false
+	}
+	value, err := parseID(strings.TrimPrefix(id, "manual-"))
+	return value, err == nil
+}
+
+// ReviewHotOffer — менеджер, директор или владелец одобряет или отклоняет предложение официанта.
+func (a *API) ReviewHotOffer(w http.ResponseWriter, r *http.Request) {
+	id, ok := manualOfferID(r.PathValue("id"))
+	var req struct {
+		Action string `json:"action"`
+	}
+	if !ok || decodeJSON(w, r, &req) != nil || (req.Action != "approve" && req.Action != "reject") {
+		a.writeError(w, http.StatusBadRequest, "Укажите решение: approve или reject")
+		return
+	}
+	status := map[string]string{"approve": "active", "reject": "rejected"}[req.Action]
+	now, _ := a.nowAndSpeed()
+	result, err := a.DB.Exec("UPDATE hot_offers_manual SET status=?,reviewed_at=? WHERE id=? AND restaurant_id=? AND status='pending'",
+		status, formatTime(now), id, restaurantOf(r))
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить решение")
+		return
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
+		a.writeError(w, http.StatusNotFound, "Предложение не найдено или уже рассмотрено")
+		return
+	}
+	a.bumpRev()
+	a.sendJSON(w, http.StatusOK, map[string]string{"status": status})
+}
+
+// HideHotOffer скрывает предложение от официантов (hidden=true) или показывает снова.
+func (a *API) HideHotOffer(w http.ResponseWriter, r *http.Request) {
+	offerID := r.PathValue("id")
+	restaurantID := restaurantOf(r)
+	var req struct {
+		Hidden bool `json:"hidden"`
+	}
+	if decodeJSON(w, r, &req) != nil {
+		a.writeError(w, http.StatusBadRequest, "Укажите hidden: true или false")
+		return
+	}
+	now, _ := a.nowAndSpeed()
+	var err error
+	if id, ok := manualOfferID(offerID); ok {
+		var result sql.Result
+		result, err = a.DB.Exec("UPDATE hot_offers_manual SET hidden=? WHERE id=? AND restaurant_id=?", req.Hidden, id, restaurantID)
+		if err == nil {
+			if count, _ := result.RowsAffected(); count == 0 {
+				a.writeError(w, http.StatusNotFound, "Предложение не найдено")
+				return
+			}
+		}
+	} else if strings.HasPrefix(offerID, "auto-") {
+		if req.Hidden {
+			_, err = a.DB.Exec("INSERT INTO hot_offer_overrides(restaurant_id,offer_id,action,created_at) VALUES(?,?,'hidden',?) "+
+				"ON CONFLICT(restaurant_id,offer_id) DO UPDATE SET action='hidden'", restaurantID, offerID, formatTime(now))
+		} else {
+			_, err = a.DB.Exec("DELETE FROM hot_offer_overrides WHERE restaurant_id=? AND offer_id=? AND action='hidden'", restaurantID, offerID)
+		}
+	} else {
+		a.writeError(w, http.StatusNotFound, "Предложение не найдено")
+		return
+	}
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить изменение")
+		return
+	}
+	a.bumpRev()
+	a.sendJSON(w, http.StatusOK, map[string]bool{"hidden": req.Hidden})
+}
+
+// DeleteHotOffer удаляет ручное предложение или убирает рассчитанное (пока не изменится причина).
+func (a *API) DeleteHotOffer(w http.ResponseWriter, r *http.Request) {
+	offerID := r.PathValue("id")
+	restaurantID := restaurantOf(r)
+	now, _ := a.nowAndSpeed()
+	var err error
+	if id, ok := manualOfferID(offerID); ok {
+		var result sql.Result
+		result, err = a.DB.Exec("DELETE FROM hot_offers_manual WHERE id=? AND restaurant_id=?", id, restaurantID)
+		if err == nil {
+			if count, _ := result.RowsAffected(); count == 0 {
+				a.writeError(w, http.StatusNotFound, "Предложение не найдено")
+				return
+			}
+		}
+	} else if strings.HasPrefix(offerID, "auto-") {
+		_, err = a.DB.Exec("INSERT INTO hot_offer_overrides(restaurant_id,offer_id,action,created_at) VALUES(?,?,'deleted',?) "+
+			"ON CONFLICT(restaurant_id,offer_id) DO UPDATE SET action='deleted'", restaurantID, offerID, formatTime(now))
+	} else {
+		a.writeError(w, http.StatusNotFound, "Предложение не найдено")
+		return
+	}
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить предложение")
+		return
+	}
+	a.bumpRev()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *API) consumptionRates(now time.Time) (map[int64]float64, map[int64]time.Time, error) {
