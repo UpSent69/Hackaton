@@ -255,6 +255,7 @@ func clearOperationalData(tx *sql.Tx) error {
 		"DELETE FROM dish_ingredients",
 		"DELETE FROM dishes",
 		"DELETE FROM batches",
+		"DELETE FROM supply_pending_items",
 		"DELETE FROM supplies",
 		"DELETE FROM products",
 		"DELETE FROM alerts",

@@ -511,6 +511,7 @@ select.input:disabled { opacity: 0.6; cursor: default; }
 
 /* Роли: зрителю не показываются элементы, которыми он не может пользоваться */
 .is-viewer [data-admin] { display: none !important; }
+.is-staff [data-delete-supply], .is-staff [data-delete-item] { display: none !important; }
 .viewer-note {
   display: none; margin-top: 16px; padding: 7px 10px; border-radius: 3px; width: fit-content;
   background: rgba(255, 255, 255, 0.06); border: 1px solid var(--line); color: var(--ink-soft);

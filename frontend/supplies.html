@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=20261015-5" />
+    <link rel="stylesheet" href="styles.css?v=20261015-7" />
     <style>
       /* Сцена страницы: конвейер, по которому едут ящики с поставкой */
       .belt { position: absolute; left: -8%; right: -8%; bottom: 34px; height: 2px; background: rgba(255, 255, 255, 0.28); }
@@ -48,7 +48,7 @@
       @keyframes rowOut { to { opacity: 0; transform: translateX(14px); } }
       tr.is-sub .item-list li { animation: rise 0.4s cubic-bezier(0.16, 1, 0.3, 1) both; animation-delay: calc(var(--i, 0) * 40ms); }
     </style>
-    <script src="motion.js?v=20261015-5"></script>
+    <script src="motion.js?v=20261015-7"></script>
   </head>
   <body>
     <div class="app" id="app">
@@ -60,7 +60,7 @@
               <span class="label home-badge">Приёмка</span>
               <h1 class="page-title">Поставки</h1>
               <p class="page-sub">Каждая строка поставки становится отдельной партией на складе со своим сроком годности.</p>
-              <p class="viewer-note label">Режим просмотра — изменять данные могут только администраторы</p>
+              <p class="viewer-note label">Поставки создают администраторы и поставщики — вы рассматриваете поставки на проверке</p>
             </div>
             <div class="hero-stats">
               <div><div class="big" id="statSupplies">0</div><div class="small">поставок</div></div>
@@ -104,6 +104,14 @@
           </div>
         </form>
 
+        <div class="section-gap" id="reviewSection" hidden>
+          <div class="form-head" style="margin-bottom: 16px">
+            <h2 class="panel-title">На проверке</h2>
+            <span class="form-msg" id="reviewMsg" role="status"></span>
+          </div>
+          <div id="reviewBody"></div>
+        </div>
+
         <div class="section-gap">
           <div class="form-head" style="margin-bottom: 16px">
             <h2 class="panel-title">История поставок</h2>
@@ -114,8 +122,8 @@
       </main>
     </div>
 
-    <script src="api.js?v=20261015-5"></script>
-        <script src="shared.js?v=20261015-5"></script>
+    <script src="api.js?v=20261015-7"></script>
+        <script src="shared.js?v=20261015-7"></script>
     <script>
       ;(() => {
         if (!UI.shell('supplies')) return
@@ -130,6 +138,28 @@
         const historyBody = document.getElementById('historyBody')
         const fileInput = document.getElementById('importFile')
         const scene = document.getElementById('scene')
+        const reviewSection = document.getElementById('reviewSection')
+        const reviewBody = document.getElementById('reviewBody')
+        const reviewMsg = document.getElementById('reviewMsg')
+
+        // Поставщик отправляет поставку на проверку; рассматривают её менеджер и администратор.
+        const role = (API.getUser() || {}).role
+        const isSupplier = role === 'supplier'
+        const canReview = role === 'admin' || role === 'manager'
+        if (isSupplier) form.querySelector('[type=submit]').textContent = 'Отправить на проверку'
+
+        const SUPPLY_STATUS = {
+          pending: ['На проверке', '#f2c24b'],
+          accepted: ['Принята', UI.STATUS.ok.color],
+          partial: ['Принята частично', '#ff8f4d'],
+          rejected: ['Отменена', '#ff5f5f'],
+        }
+        const supplyBadge = (status) => {
+          const [label, color] = SUPPLY_STATUS[status] || SUPPLY_STATUS.accepted
+          return `<span class="label status" style="--status-color:${color}">${label}</span>`
+        }
+        // Состав поставки: принятые партии на складе, а пока поставка не принята — отправленные позиции.
+        const supplyLines = (supply) => (supply.items.length ? supply.items : supply.proposed || [])
 
         let products = []
         // Поставку можно раскрыть сразу по ссылке вида supplies.html?open=…
@@ -290,11 +320,13 @@
           try {
             const supply = await UI.call(API.post('/supplies', { number: numberInput.value.trim(), items, importId: importId || undefined }))
             importId = null
-            UI.setMessage(formMsg, `Поставка ${supply.number} принята, партий создано: ${supply.items.length}`)
+            UI.setMessage(formMsg, supply.status === 'pending'
+              ? `Поставка ${supply.number} отправлена на проверку менеджеру`
+              : `Поставка ${supply.number} принята, партий создано: ${supply.items.length}`)
             numberInput.value = ''
             rows.innerHTML = rowHtml(null, true)
             highlightId = supply.id
-            dropCrate()
+            if (supply.status !== 'pending') dropCrate()
             await refresh(true)
           } catch (error) {
             UI.setMessage(formMsg, error.message, true)
@@ -320,6 +352,7 @@
             return
           }
 
+          renderReview(supplies.filter((supply) => supply.status === 'pending'))
           UI.countUp(document.getElementById('statSupplies'), supplies.length)
           UI.countUp(document.getElementById('statBatches'), supplies.reduce((sum, supply) => sum + supply.items.length, 0))
           UI.countUp(document.getElementById('statProducts'), new Set(supplies.flatMap((supply) => supply.items.map((item) => item.productId))).size)
@@ -329,7 +362,7 @@
             return
           }
           historyBody.innerHTML = `<div class="glass table-wrap rise"><table class="table">
-            <thead><tr><th class="col-chev"></th><th>Номер</th><th>Получена</th><th class="num">Позиций</th><th>Состав</th><th></th></tr></thead>
+            <thead><tr><th class="col-chev"></th><th>Номер</th><th>Создана</th><th>Статус</th><th class="num">Позиций</th><th>Состав</th><th></th></tr></thead>
             <tbody>
               ${supplies
                 .map((supply, index) => {
@@ -337,14 +370,27 @@
                   return `<tr class="is-click rise" ${UI.order(index)} data-supply="${escapeHtml(supply.id)}" data-number="${escapeHtml(supply.number)}">
                     <td class="col-chev">${UI.chevron(open)}</td>
                     <td class="strong nowrap">${escapeHtml(supply.number)}</td>
-                    <td class="dim nowrap">${formatDateTime(supply.createdAt)}</td>
-                    <td class="num">${supply.items.length}</td>
-                    <td class="dim">${supply.items.map((item) => escapeHtml(item.name)).join(' · ')}</td>
+                    <td class="dim nowrap">${formatDateTime(supply.createdAt)}${supply.createdBy ? `<div class="cell-note">${escapeHtml(supply.createdBy)}</div>` : ''}</td>
+                    <td class="nowrap">${supplyBadge(supply.status)}</td>
+                    <td class="num">${supplyLines(supply).length}</td>
+                    <td class="dim">${supplyLines(supply).map((item) => escapeHtml(item.name)).join(' · ')}</td>
                     <td class="num"><button type="button" class="btn btn-sm btn-line" data-delete-supply data-admin>Удалить поставку</button></td>
                   </tr>
                   ${
                     open
-                      ? `<tr class="is-sub"><td></td><td colspan="5"><ul class="item-list">
+                      ? `<tr class="is-sub"><td></td><td colspan="6">
+                          ${supply.comment ? `<p class="cell-note" style="margin:0 0 10px">Комментарий проверяющего: ${escapeHtml(supply.comment)}</p>` : ''}
+                          <ul class="item-list">
+                          ${(supply.proposed || [])
+                            .filter((item) => !supply.items.length || item.decision === 'rejected')
+                            .map(
+                              (item, itemIndex) => `<li ${UI.order(itemIndex)}>
+                                <span>${escapeHtml(item.name)}</span>
+                                <span>${formatQuantity(item.quantity, item.unit)}</span>
+                                <span class="dim">${item.decision === 'rejected' ? 'не принята' : item.decision === 'accepted' ? 'принята' : 'ждёт проверки'} · срок ${item.shelfLifeHours} ч</span>
+                              </li>`,
+                            )
+                            .join('')}
                           ${supply.items
                             .map(
                               (item, itemIndex) => `<li ${UI.order(itemIndex)}>
@@ -368,6 +414,79 @@
             highlightId = null
           }
         }
+
+        /* ---------- Проверка поставок ---------- */
+
+        // Менеджер и администратор отмечают позиции, которые принимают; снятые галочки — отказ от позиции.
+        function renderReview(pending) {
+          reviewSection.hidden = !canReview || pending.length === 0
+          if (reviewSection.hidden) return
+          // Отметки и комментарии сохраняются при тихом обновлении списка.
+          const kept = new Map([...reviewBody.querySelectorAll('[data-review]')].map((card) => [card.dataset.review, {
+            unchecked: [...card.querySelectorAll('[data-item]:not(:checked)')].map((box) => box.value),
+            comment: card.querySelector('[name=comment]').value,
+          }]))
+          reviewBody.innerHTML = pending
+            .map((supply) => {
+              const state = kept.get(supply.id) || { unchecked: [], comment: '' }
+              return `<div class="glass form" style="margin-bottom:16px" data-review="${escapeHtml(supply.id)}" data-number="${escapeHtml(supply.number)}">
+                <div class="form-head">
+                  <h3 class="panel-title">Поставка ${escapeHtml(supply.number)}</h3>
+                  <span class="dim">${escapeHtml(supply.createdBy || 'Поставщик')} · ${formatDateTime(supply.createdAt)}</span>
+                </div>
+                <ul class="item-list">
+                  ${supply.proposed
+                    .map((item) => `<li><label style="display:flex;gap:10px;align-items:center;cursor:pointer">
+                      <input type="checkbox" data-item value="${escapeHtml(item.id)}"${state.unchecked.includes(item.id) ? '' : ' checked'} />
+                      <span>${escapeHtml(item.name)}</span></label>
+                      <span>${formatQuantity(item.quantity, item.unit)}</span>
+                      <span class="dim">срок хранения ${item.shelfLifeHours} ч</span></li>`)
+                    .join('')}
+                </ul>
+                <label class="field" style="margin-top:12px"><span class="label">Комментарий поставщику</span>
+                  <input class="input" name="comment" maxlength="500" placeholder="Обязателен при отмене, например: нет потребности в этих позициях" value="${escapeHtml(state.comment)}" /></label>
+                <div class="form-foot">
+                  <button type="button" class="btn btn-solid" data-accept>Принять отмеченные</button>
+                  <button type="button" class="btn btn-line" data-reject>Отменить поставку</button>
+                  <span class="form-msg" role="status"></span>
+                </div>
+              </div>`
+            })
+            .join('')
+        }
+
+        reviewBody.addEventListener('click', async (event) => {
+          const button = event.target.closest('[data-accept], [data-reject]')
+          if (!button) return
+          const card = button.closest('[data-review]')
+          const message = card.querySelector('.form-msg')
+          const comment = card.querySelector('[name=comment]')
+          const acceptedItemIds = [...card.querySelectorAll('[data-item]:checked')].map((box) => box.value)
+          const reject = button.hasAttribute('data-reject')
+          comment.classList.remove('is-invalid')
+          if (reject && !comment.value.trim()) {
+            comment.classList.add('is-invalid')
+            UI.setMessage(message, 'Напишите поставщику причину отмены', true)
+            return
+          }
+          if (!reject && acceptedItemIds.length === 0) {
+            UI.setMessage(message, 'Отметьте хотя бы одну позицию или отмените поставку', true)
+            return
+          }
+          card.querySelectorAll('button').forEach((node) => (node.disabled = true))
+          try {
+            const supply = await UI.call(API.post('/supplies/' + encodeURIComponent(card.dataset.review) + '/review', {
+              action: reject ? 'reject' : 'accept', acceptedItemIds, comment: comment.value.trim(),
+            }))
+            UI.setMessage(reviewMsg, `Поставка ${supply.number}: ${SUPPLY_STATUS[supply.status][0].toLowerCase()}`)
+            if (supply.status !== 'rejected') dropCrate()
+            highlightId = supply.id
+            await refresh(true)
+          } catch (error) {
+            UI.setMessage(message, error.message, true)
+            card.querySelectorAll('button').forEach((node) => (node.disabled = false))
+          }
+        })
 
         // silent — тихое обновление: без повторного проигрывания анимаций появления.
         async function refresh(silent) {

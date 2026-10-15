@@ -34,7 +34,7 @@ func Init(dbPath string) (*sql.DB, error) {
 		"id INTEGER PRIMARY KEY AUTOINCREMENT, login TEXT UNIQUE NOT NULL, password TEXT NOT NULL);" +
 		"CREATE TABLE IF NOT EXISTS accounts (" +
 		"id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE, " +
-		"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager')), created_at TEXT NOT NULL);" +
+		"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager','waiter','supplier')), created_at TEXT NOT NULL);" +
 		"CREATE TABLE IF NOT EXISTS auth_sessions (" +
 		"jti TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, " +
 		"expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);" +
@@ -76,6 +76,10 @@ func Init(dbPath string) (*sql.DB, error) {
 		"created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'saved');" +
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_requests_source_hash ON customer_requests(source_sha256) WHERE source_sha256 <> '';" +
 		requestItemsSchema +
+		"CREATE TABLE IF NOT EXISTS supply_pending_items (" +
+		"id INTEGER PRIMARY KEY AUTOINCREMENT, supply_id INTEGER NOT NULL REFERENCES supplies(id) ON DELETE CASCADE, " +
+		"name TEXT NOT NULL, unit TEXT NOT NULL, quantity INTEGER NOT NULL, shelf_life_hours REAL NOT NULL, " +
+		"lot_number TEXT NOT NULL DEFAULT '', decision TEXT NOT NULL DEFAULT 'pending');" +
 		"CREATE TABLE IF NOT EXISTS supply_imports (" +
 		"id INTEGER PRIMARY KEY AUTOINCREMENT, source_filename TEXT NOT NULL DEFAULT '', source_sha256 TEXT NOT NULL DEFAULT '', " +
 		"parser_mode TEXT NOT NULL, ai_used INTEGER NOT NULL DEFAULT 0, detected_number TEXT NOT NULL DEFAULT '', " +
@@ -106,6 +110,16 @@ func Init(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("migrate request items: %w", err)
 	}
 	// Batch (lot) number of a supply row; older batches simply keep an empty value.
+	// Проверка поставок: статус, автор и решение проверяющего. Старые поставки считаются принятыми.
+	for column, definition := range map[string]string{
+		"status": "TEXT NOT NULL DEFAULT 'accepted'", "created_by": "INTEGER NULL",
+		"review_comment": "TEXT NOT NULL DEFAULT ''", "reviewed_at": "TEXT NULL",
+	} {
+		if err := ensureColumn(db, "supplies", column, definition); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate supply review: %w", err)
+		}
+	}
 	if err := ensureColumn(db, "batches", "lot_number", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate batch lot number: %w", err)
@@ -114,6 +128,10 @@ func Init(dbPath string) (*sql.DB, error) {
 	if err := migrateRoles(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate account roles: %w", err)
+	}
+	if err := migrateStaffRoles(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate staff roles: %w", err)
 	}
 
 	// Migrate administrator records created by the older application.
@@ -199,7 +217,7 @@ func migrateRoles(db *sql.DB) error {
 	for _, statement := range []string{
 		"CREATE TABLE accounts_new (" +
 			"id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE, " +
-			"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager')), created_at TEXT NOT NULL)",
+			"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager','waiter','supplier')), created_at TEXT NOT NULL)",
 		"INSERT INTO accounts_new(id,name,email,password_hash,role,created_at) " +
 			"SELECT id,name,email,password_hash,CASE WHEN role='admin' THEN 'admin' ELSE 'manager' END,created_at FROM accounts",
 		"DROP TABLE accounts",
@@ -257,6 +275,41 @@ func migrateRequestItems(db *sql.DB) error {
 		"DELETE FROM customer_requests",
 		"DROP TABLE customer_request_items",
 		requestItemsSchema,
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// migrateStaffRoles расширяет ограничение роли в accounts ролями официанта и поставщика.
+// SQLite не меняет CHECK на месте, поэтому таблица пересоздаётся; данные и id сохраняются.
+func migrateStaffRoles(db *sql.DB) error {
+	var schema string
+	if err := db.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'").Scan(&schema); err != nil {
+		return err
+	}
+	if strings.Contains(schema, "'waiter'") {
+		return nil
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys = OFF"); err != nil {
+		return err
+	}
+	defer db.Exec("PRAGMA foreign_keys = ON")
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, statement := range []string{
+		"CREATE TABLE accounts_new (" +
+			"id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE, " +
+			"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager','waiter','supplier')), created_at TEXT NOT NULL)",
+		"INSERT INTO accounts_new(id,name,email,password_hash,role,created_at) SELECT id,name,email,password_hash,role,created_at FROM accounts",
+		"DROP TABLE accounts",
+		"ALTER TABLE accounts_new RENAME TO accounts",
 	} {
 		if _, err := tx.Exec(statement); err != nil {
 			return err

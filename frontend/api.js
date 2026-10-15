@@ -49,6 +49,13 @@ const API = (() => {
     localStorage.removeItem(USER_KEY)
   }
 
+  // Официант и поставщик работают каждый на своей странице.
+  const ROLE_HOME = { waiter: 'orders.html', supplier: 'supplies.html' }
+  const roleHome = () => {
+    const user = getUser()
+    return (user && ROLE_HOME[user.role]) || ''
+  }
+
   /* ---------- Время и ревизия данных ---------- */
 
   // Часы сервера: в демо-режиме время на сервере может идти быстрее реального,
@@ -145,6 +152,7 @@ const API = (() => {
     awaitJob,
     del: (path) => remote('DELETE', path),
     getUser,
+    roleHome,
     setSession,
     updateUser: (user) => localStorage.setItem(USER_KEY, JSON.stringify(user)),
     clearSession,
@@ -153,4 +161,12 @@ const API = (() => {
     // Ревизия данных после последнего собственного запроса.
     rev: () => lastRev,
   }
+})()
+
+// С чужих страниц официанта и поставщика сразу переводит на их страницу (доступ к данным
+// всё равно проверяет сервер — это только чтобы не показывать пустые экраны с ошибкой прав).
+;(() => {
+  const home = API.roleHome()
+  const page = location.pathname.split('/').pop() || 'index.html'
+  if (home && page !== home && page !== 'login.html') location.replace(home)
 })()

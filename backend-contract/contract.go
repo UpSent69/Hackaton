@@ -42,6 +42,8 @@ type Role string
 const (
 	RoleAdmin  Role = "admin"
 	RoleManager Role = "manager" // менеджер: видит все данные, но не меняет их
+	RoleWaiter   Role = "waiter"   // официант: только страница «Заказы» — меню и оформление заказов
+	RoleSupplier Role = "supplier" // поставщик: только страница «Поставки» — приёмка и импорт
 )
 
 // ---------- Ошибки ----------
@@ -59,6 +61,7 @@ type RegisterRequest struct {
 	Name     string `json:"name"`
 	Email    string `json:"email"`
 	Password string `json:"password"` // не короче 6 символов
+	Role     Role   `json:"role,omitempty"` // manager (по умолчанию), waiter или supplier
 }
 
 type LoginRequest struct {
@@ -70,6 +73,7 @@ type LoginRequest struct {
 type CreateManagerRequest struct {
 	Login    string `json:"login"`    // латиница, цифры, «.», «_», «-», от 3 до 64 символов
 	Password string `json:"password"` // не короче 6 символов
+	Role     Role   `json:"role,omitempty"` // manager (по умолчанию), waiter или supplier
 }
 
 // RegistrationState — открыта ли самостоятельная регистрация (только для первых двух администраторов).
@@ -160,7 +164,44 @@ type Supply struct {
 	ID        string       `json:"id"`
 	Number    string       `json:"number"`
 	CreatedAt time.Time    `json:"createdAt"`
-	Items     []SupplyItem `json:"items"`
+	Items     []SupplyItem `json:"items"` // партии на складе (только у принятых поставок)
+
+	Status     SupplyStatus         `json:"status"`
+	CreatedBy  string               `json:"createdBy"`            // имя автора поставки
+	Comment    string               `json:"comment"`              // комментарий проверяющего
+	ReviewedAt *time.Time           `json:"reviewedAt,omitempty"` // когда рассмотрена
+	Proposed   []SupplyProposedItem `json:"proposed"`             // позиции, отправленные поставщиком на проверку
+}
+
+// SupplyStatus — состояние поставки. Поставка администратора сразу accepted;
+// поставка поставщика pending, пока её не рассмотрят менеджер или администратор.
+type SupplyStatus string
+
+const (
+	SupplyPending  SupplyStatus = "pending"
+	SupplyAccepted SupplyStatus = "accepted"
+	SupplyPartial  SupplyStatus = "partial"
+	SupplyRejected SupplyStatus = "rejected"
+)
+
+// SupplyProposedItem — позиция поставки поставщика. Decision: pending, accepted или rejected.
+type SupplyProposedItem struct {
+	ID             string  `json:"id"`
+	Name           string  `json:"name"`
+	Unit           Unit    `json:"unit"`
+	Quantity       int64   `json:"quantity"`
+	ShelfLifeHours float64 `json:"shelfLifeHours"`
+	LotNumber      string  `json:"lotNumber"`
+	Decision       string  `json:"decision"`
+}
+
+// ReviewSupplyRequest — решение по поставке на проверке.
+// accept: на склад идут только позиции из AcceptedItemIDs (не пусто); остальные отклоняются.
+// reject: поставка отменяется целиком, Comment обязателен.
+type ReviewSupplyRequest struct {
+	Action          string   `json:"action"` // accept | reject
+	AcceptedItemIDs []string `json:"acceptedItemIds"`
+	Comment         string   `json:"comment"`
 }
 
 type SupplyItem struct {

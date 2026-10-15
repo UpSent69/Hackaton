@@ -379,7 +379,12 @@ func (a *API) Expiry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) Supplies(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.DB.Query("SELECT id,number,created_at FROM supplies ORDER BY created_at DESC,id DESC")
+	// Поставщик видит только свои поставки, остальные роли — все.
+	query, args := "SELECT id,number,created_at FROM supplies ORDER BY created_at DESC,id DESC", []any{}
+	if auth := currentAuth(r); auth != nil && auth.User.Role == contract.RoleSupplier {
+		query, args = "SELECT id,number,created_at FROM supplies WHERE created_by=? ORDER BY created_at DESC,id DESC", []any{auth.User.ID}
+	}
+	rows, err := a.DB.Query(query, args...)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить поставки")
 		return
@@ -422,13 +427,38 @@ func (a *API) Supplies(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) loadSupply(id int64) (contract.Supply, error) {
 	var supply contract.Supply
-	var created string
-	if err := a.DB.QueryRow("SELECT id,number,created_at FROM supplies WHERE id=?", id).
-		Scan(&id, &supply.Number, &created); err != nil {
+	var created, status string
+	var reviewed sql.NullString
+	if err := a.DB.QueryRow(
+		"SELECT s.id,s.number,s.created_at,s.status,s.review_comment,s.reviewed_at,COALESCE(a.name,'') "+
+			"FROM supplies s LEFT JOIN accounts a ON a.id=s.created_by WHERE s.id=?", id).
+		Scan(&id, &supply.Number, &created, &status, &supply.Comment, &reviewed, &supply.CreatedBy); err != nil {
 		return supply, err
 	}
 	supply.ID = strconv.FormatInt(id, 10)
 	supply.CreatedAt = parseTime(created)
+	supply.Status = contract.SupplyStatus(status)
+	if reviewed.Valid {
+		at := parseTime(reviewed.String)
+		supply.ReviewedAt = &at
+	}
+	proposed, err := a.DB.Query(
+		"SELECT id,name,unit,quantity,shelf_life_hours,lot_number,decision FROM supply_pending_items WHERE supply_id=? ORDER BY id", id)
+	if err != nil {
+		return supply, err
+	}
+	supply.Proposed = make([]contract.SupplyProposedItem, 0)
+	for proposed.Next() {
+		var item contract.SupplyProposedItem
+		var itemID int64
+		if err := proposed.Scan(&itemID, &item.Name, &item.Unit, &item.Quantity, &item.ShelfLifeHours, &item.LotNumber, &item.Decision); err != nil {
+			proposed.Close()
+			return supply, err
+		}
+		item.ID = strconv.FormatInt(itemID, 10)
+		supply.Proposed = append(supply.Proposed, item)
+	}
+	proposed.Close()
 	rows, err := a.DB.Query(
 		"SELECT p.id,p.name,p.unit,b.qty_initial,b.expires_at,b.lot_number FROM batches b "+
 			"JOIN products p ON p.id=b.product_id WHERE b.supply_id=? ORDER BY p.name COLLATE NOCASE,b.id",
@@ -496,6 +526,17 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now, _ := a.nowAndSpeed()
+	auth := currentAuth(r)
+	var authorID any
+	if auth != nil {
+		authorID = auth.User.ID
+	}
+	// Поставка поставщика не попадает на склад сразу: она ждёт проверки менеджера или администратора.
+	pending := auth != nil && auth.User.Role == contract.RoleSupplier
+	status := contract.SupplyAccepted
+	if pending {
+		status = contract.SupplyPending
+	}
 	tx, err := a.DB.Begin()
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось начать запись поставки")
@@ -503,7 +544,8 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	result, err := tx.Exec("INSERT INTO supplies(number,created_at) VALUES(?,?)", req.Number, formatTime(now))
+	result, err := tx.Exec("INSERT INTO supplies(number,created_at,status,created_by) VALUES(?,?,?,?)",
+		req.Number, formatTime(now), string(status), authorID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "constraint") {
 			a.writeError(w, http.StatusConflict, "Поставка с таким номером уже существует")
@@ -519,44 +561,14 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, item := range req.Items {
-		norm := normalizeName(item.Name)
-		var productID int64
-		var productName string
-		var productUnit contract.Unit
-		err := tx.QueryRow("SELECT id,name,unit FROM products WHERE norm_name=?", norm).Scan(&productID, &productName, &productUnit)
-		if err == sql.ErrNoRows {
-			productName = strings.TrimSpace(item.Name)
-			productUnit = item.Unit
-			res, insertErr := tx.Exec("INSERT INTO products(name,norm_name,unit) VALUES(?,?,?)", productName, norm, string(productUnit))
-			if insertErr != nil {
-				a.writeError(w, http.StatusInternalServerError, "Не удалось создать продукт")
-				return
-			}
-			productID, err = res.LastInsertId()
-			if err != nil {
-				a.writeError(w, http.StatusInternalServerError, "Не удалось создать продукт")
-				return
-			}
-		} else if err != nil {
-			a.writeError(w, http.StatusInternalServerError, "Не удалось найти продукт")
-			return
-		} else if productUnit != item.Unit {
-			a.writeError(w, http.StatusBadRequest, fmt.Sprintf("Для продукта «%s» уже задана другая единица измерения", productName))
-			return
+		var err error
+		if pending {
+			err = queueSupplyItem(tx, supplyID, item)
+		} else {
+			err = insertSupplyBatch(tx, supplyID, item, now)
 		}
-
-		expires := now.Add(time.Duration(item.ShelfLifeHours * float64(time.Hour)))
-		status := batchStatus(now, expires, now)
-		lot := strings.TrimSpace(item.LotNumber)
-		if lot == "" {
-			lot = randomLotNumber()
-		}
-		if _, err := tx.Exec(
-			"INSERT INTO batches(product_id,supply_id,qty_initial,qty_remaining,written_off,received_at,expires_at,last_status,lot_number) "+
-				"VALUES(?,?,?,?,0,?,?,?,?)",
-			productID, supplyID, item.Quantity, item.Quantity, formatTime(now), formatTime(expires), string(status), lot,
-		); err != nil {
-			a.writeError(w, http.StatusInternalServerError, "Не удалось создать партию продукта")
+		if err != nil {
+			a.writeSupplyItemError(w, err)
 			return
 		}
 	}
@@ -574,6 +586,9 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 	if err := tx.Commit(); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить поставку")
 		return
+	}
+	if pending {
+		a.addAlert(contract.AlertLevel("warning"), fmt.Sprintf("Поставщик %s отправил поставку %s на проверку.", auth.User.Name, req.Number), now)
 	}
 	a.bumpRev()
 	supply, err := a.loadSupply(supplyID)
@@ -692,4 +707,215 @@ func (a *API) WriteOffBatch(w http.ResponseWriter, r *http.Request) {
 	a.sendJSON(w, http.StatusOK, map[string]any{
 		"id": strconv.FormatInt(batch.ID, 10), "writtenOff": batch.QtyRemaining, "qtyRemaining": 0,
 	})
+}
+
+// supplyItemError — ошибка строки поставки, которую можно показать пользователю.
+type supplyItemError struct {
+	status  int
+	message string
+}
+
+func (e supplyItemError) Error() string { return e.message }
+
+func (a *API) writeSupplyItemError(w http.ResponseWriter, err error) {
+	if itemErr, ok := err.(supplyItemError); ok {
+		a.writeError(w, itemErr.status, itemErr.message)
+		return
+	}
+	a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить позицию поставки")
+}
+
+// checkSupplyUnit — у известного продукта единица измерения уже задана и должна совпасть.
+func checkSupplyUnit(tx *sql.Tx, item contract.SupplyItemInput) error {
+	var name string
+	var unit contract.Unit
+	err := tx.QueryRow("SELECT name,unit FROM products WHERE norm_name=?", normalizeName(item.Name)).Scan(&name, &unit)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if unit != item.Unit {
+		return supplyItemError{http.StatusBadRequest, fmt.Sprintf("Для продукта «%s» уже задана другая единица измерения", name)}
+	}
+	return nil
+}
+
+// queueSupplyItem сохраняет позицию поставки поставщика до решения проверяющего.
+func queueSupplyItem(tx *sql.Tx, supplyID int64, item contract.SupplyItemInput) error {
+	if err := checkSupplyUnit(tx, item); err != nil {
+		return err
+	}
+	lot := strings.TrimSpace(item.LotNumber)
+	if lot == "" {
+		lot = randomLotNumber()
+	}
+	_, err := tx.Exec(
+		"INSERT INTO supply_pending_items(supply_id,name,unit,quantity,shelf_life_hours,lot_number) VALUES(?,?,?,?,?,?)",
+		supplyID, strings.TrimSpace(item.Name), string(item.Unit), item.Quantity, item.ShelfLifeHours, lot,
+	)
+	return err
+}
+
+// insertSupplyBatch заводит позицию на склад: находит или создаёт продукт и создаёт партию,
+// срок годности которой отсчитывается от now (момента приёмки).
+func insertSupplyBatch(tx *sql.Tx, supplyID int64, item contract.SupplyItemInput, now time.Time) error {
+	if err := checkSupplyUnit(tx, item); err != nil {
+		return err
+	}
+	norm := normalizeName(item.Name)
+	var productID int64
+	err := tx.QueryRow("SELECT id FROM products WHERE norm_name=?", norm).Scan(&productID)
+	if err == sql.ErrNoRows {
+		res, insertErr := tx.Exec("INSERT INTO products(name,norm_name,unit) VALUES(?,?,?)", strings.TrimSpace(item.Name), norm, string(item.Unit))
+		if insertErr != nil {
+			return insertErr
+		}
+		if productID, err = res.LastInsertId(); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	expires := now.Add(time.Duration(item.ShelfLifeHours * float64(time.Hour)))
+	lot := strings.TrimSpace(item.LotNumber)
+	if lot == "" {
+		lot = randomLotNumber()
+	}
+	_, err = tx.Exec(
+		"INSERT INTO batches(product_id,supply_id,qty_initial,qty_remaining,written_off,received_at,expires_at,last_status,lot_number) "+
+			"VALUES(?,?,?,?,0,?,?,?,?)",
+		productID, supplyID, item.Quantity, item.Quantity, formatTime(now), formatTime(expires), string(batchStatus(now, expires, now)), lot,
+	)
+	return err
+}
+
+// ReviewSupply — менеджер или администратор рассматривает поставку поставщика:
+// принимает целиком, частично (отказавшись от части позиций) или отменяет.
+func (a *API) ReviewSupply(w http.ResponseWriter, r *http.Request) {
+	supplyID, err := parseID(r.PathValue("id"))
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор поставки")
+		return
+	}
+	var req contract.ReviewSupplyRequest
+	if err := decodeJSON(w, r, &req); err != nil || (req.Action != "accept" && req.Action != "reject") {
+		a.writeError(w, http.StatusBadRequest, "Укажите решение: accept или reject")
+		return
+	}
+	req.Comment = strings.TrimSpace(req.Comment)
+	if len(req.Comment) > 500 {
+		a.writeError(w, http.StatusBadRequest, "Комментарий — не длиннее 500 символов")
+		return
+	}
+	if req.Action == "reject" && req.Comment == "" {
+		a.writeError(w, http.StatusBadRequest, "Укажите причину отмены поставки")
+		return
+	}
+
+	var number, status string
+	if err := a.DB.QueryRow("SELECT number,status FROM supplies WHERE id=?", supplyID).Scan(&number, &status); err == sql.ErrNoRows {
+		a.writeError(w, http.StatusNotFound, "Поставка не найдена")
+		return
+	} else if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось найти поставку")
+		return
+	}
+	if status != string(contract.SupplyPending) {
+		a.writeError(w, http.StatusConflict, "Поставка уже рассмотрена")
+		return
+	}
+
+	type proposedRow struct {
+		ID   int64
+		Item contract.SupplyItemInput
+	}
+	rows, err := a.DB.Query("SELECT id,name,unit,quantity,shelf_life_hours,lot_number FROM supply_pending_items WHERE supply_id=? ORDER BY id", supplyID)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось прочитать позиции поставки")
+		return
+	}
+	proposed := make([]proposedRow, 0)
+	for rows.Next() {
+		var row proposedRow
+		if err := rows.Scan(&row.ID, &row.Item.Name, &row.Item.Unit, &row.Item.Quantity, &row.Item.ShelfLifeHours, &row.Item.LotNumber); err != nil {
+			rows.Close()
+			a.writeError(w, http.StatusInternalServerError, "Не удалось прочитать позиции поставки")
+			return
+		}
+		proposed = append(proposed, row)
+	}
+	rows.Close()
+
+	accepted := make(map[int64]bool)
+	if req.Action == "accept" {
+		known := make(map[int64]bool, len(proposed))
+		for _, row := range proposed {
+			known[row.ID] = true
+		}
+		for _, raw := range req.AcceptedItemIDs {
+			id, err := parseID(raw)
+			if err != nil || !known[id] {
+				a.writeError(w, http.StatusBadRequest, "В решении есть позиция не из этой поставки")
+				return
+			}
+			accepted[id] = true
+		}
+		if len(accepted) == 0 {
+			a.writeError(w, http.StatusBadRequest, "Отметьте хотя бы одну позицию или отмените поставку")
+			return
+		}
+	}
+
+	now, _ := a.nowAndSpeed()
+	tx, err := a.DB.Begin()
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось начать запись решения")
+		return
+	}
+	defer tx.Rollback()
+	for _, row := range proposed {
+		decision := "rejected"
+		if accepted[row.ID] {
+			decision = "accepted"
+			if err := insertSupplyBatch(tx, supplyID, row.Item, now); err != nil {
+				a.writeSupplyItemError(w, err)
+				return
+			}
+		}
+		if _, err := tx.Exec("UPDATE supply_pending_items SET decision=? WHERE id=?", decision, row.ID); err != nil {
+			a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить решение")
+			return
+		}
+	}
+	newStatus := contract.SupplyRejected
+	switch {
+	case req.Action == "accept" && len(accepted) == len(proposed):
+		newStatus = contract.SupplyAccepted
+	case req.Action == "accept":
+		newStatus = contract.SupplyPartial
+	}
+	if _, err := tx.Exec("UPDATE supplies SET status=?,review_comment=?,reviewed_at=? WHERE id=?",
+		string(newStatus), req.Comment, formatTime(now), supplyID); err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить решение")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить решение")
+		return
+	}
+	text := map[contract.SupplyStatus]string{
+		contract.SupplyAccepted: "Поставка %s принята и поступила на склад.",
+		contract.SupplyPartial:  "Поставка %s принята частично.",
+		contract.SupplyRejected: "Поставка %s отменена.",
+	}[newStatus]
+	a.addAlert(contract.AlertLevel("ok"), fmt.Sprintf(text, number), now)
+	a.bumpRev()
+	supply, err := a.loadSupply(supplyID)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Решение сохранено, но поставку не удалось прочитать")
+		return
+	}
+	a.sendJSON(w, http.StatusOK, supply)
 }

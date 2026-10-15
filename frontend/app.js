@@ -500,8 +500,9 @@
 
   /* ---------- Администрирование: кто может изменять данные ---------- */
 
+  const ROLE_LABEL = { admin: 'Администратор', manager: 'Менеджер', waiter: 'Официант', supplier: 'Поставщик' }
   const roleBadge = (role) =>
-    `<span class="label status" style="--status-color:${role === 'admin' ? STATUS.ok.color : 'rgba(255,255,255,0.3)'}">${role === 'admin' ? 'Администратор' : 'Менеджер'}</span>`
+    `<span class="label status" style="--status-color:${role === 'admin' ? STATUS.ok.color : 'rgba(255,255,255,0.3)'}">${ROLE_LABEL[role] || role}</span>`
 
   async function adminView() {
     // Менеджерам страница не нужна: пользователей видит и заводит только администратор.
@@ -510,12 +511,17 @@
       return
     }
     view.innerHTML = `<main class="page">
-      ${pageHeader('Администрирование', 'Первые два зарегистрированных пользователя — администраторы: принимают и удаляют поставки, сохраняют заявки, ведут меню, оформляют заказы. Остальные — менеджеры: видят все данные на сайте, но не меняют их.')}
+      ${pageHeader('Администрирование', 'Первые два зарегистрированных пользователя — администраторы: принимают и удаляют поставки, сохраняют заявки, ведут меню, оформляют заказы. Менеджеры видят все данные на сайте, но не меняют их. Официанту доступна только страница «Заказы» (оформляет заказы), поставщику — только «Поставки» (принимает и импортирует поставки).')}
       <form class="glass form" id="managerForm" novalidate style="margin-bottom:32px">
-        <h2 class="panel-title">Добавить менеджера</h2>
-        <div class="supply-row" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto">
+        <h2 class="panel-title">Добавить сотрудника</h2>
+        <div class="supply-row" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 0.8fr) auto">
           <label class="field"><span class="label">Логин</span><input class="input" name="login" autocomplete="off" placeholder="Например, ivanov" /></label>
           <label class="field"><span class="label">Пароль</span><input class="input" name="password" type="password" autocomplete="new-password" placeholder="Не короче 6 символов" /></label>
+          <label class="field"><span class="label">Роль</span><select class="input" name="role">
+            <option value="manager">Менеджер</option>
+            <option value="waiter">Официант</option>
+            <option value="supplier">Поставщик</option>
+          </select></label>
           <button type="submit" class="btn btn-solid">Создать</button>
         </div>
         <span class="form-msg" id="managerMsg" role="status"></span>
@@ -544,7 +550,7 @@
         <div class="stop-summary" style="margin-bottom:20px">
           <div class="glass stat"><div class="big">${users.length}</div><div class="small">всего аккаунтов</div></div>
           <div class="glass stat"><div class="big">${admins}</div><div class="small">могут изменять данные</div></div>
-          <div class="glass stat"><div class="big">${users.length - admins}</div><div class="small">менеджеров — только просмотр</div></div>
+          <div class="glass stat"><div class="big">${users.length - admins}</div><div class="small">сотрудников с ограниченным доступом</div></div>
         </div>
         <div class="glass table-wrap"><table class="table">
           <thead><tr><th>Имя</th><th>Почта</th><th>Роль</th><th></th></tr></thead>
@@ -568,7 +574,7 @@
               .join('')}
           </tbody>
         </table></div>
-        ${users.length === 1 ? '<p class="page-sub" style="margin-top:16px">Других аккаунтов пока нет. Добавьте менеджеров формой выше.</p>' : ''}`
+        ${users.length === 1 ? '<p class="page-sub" style="margin-top:16px">Других аккаунтов пока нет. Добавьте сотрудников формой выше.</p>' : ''}`
     }
 
     const managerForm = document.getElementById('managerForm')
@@ -577,6 +583,7 @@
       event.preventDefault()
       const login = managerForm.elements.login.value.trim().toLowerCase()
       const password = managerForm.elements.password.value
+      const role = managerForm.elements.role.value
       managerForm.querySelectorAll('.input').forEach((input) => input.classList.remove('is-invalid'))
       if (!/^[a-z0-9._-]{3,64}$/.test(login)) {
         managerForm.elements.login.classList.add('is-invalid')
@@ -591,8 +598,8 @@
       const submit = managerForm.querySelector('[type=submit]')
       submit.disabled = true
       try {
-        await call(API.post('/users', { login, password }))
-        setMessage(managerMsg, `Менеджер ${login} создан — он может войти с этим логином и паролем`)
+        await call(API.post('/users', { login, password, role }))
+        setMessage(managerMsg, `${ROLE_LABEL[role]} ${login} создан — можно войти с этим логином и паролем`)
         managerForm.reset()
         await loadUsers()
       } catch (error) {

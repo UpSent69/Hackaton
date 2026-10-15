@@ -172,6 +172,9 @@ const UI = (() => {
     return Boolean(user && user.role === 'admin')
   }
 
+  // Официанту в шапке видна только вкладка «Заказы», поставщику — только «Поставки».
+  const ROLE_NAV = { waiter: ['orders'], supplier: ['supplies'] }
+
   // Шапка отвечает только за отображение и навигацию. Доступ к данным
   // проверяет API: страница не перенаправляет пользователя при 401/403.
   function shell(active) {
@@ -179,9 +182,12 @@ const UI = (() => {
     const admin = Boolean(user && user.role === 'admin')
     const app = document.getElementById('app')
     // Менеджер видит все данные, но кнопки изменения у него скрыты (см. [data-admin] в styles.css).
-    app.classList.toggle('is-viewer', Boolean(user) && !admin)
+    // Официант и поставщик меняют данные на своей странице, но удалять поставки не могут (is-staff).
+    const only = user && ROLE_NAV[user.role]
+    app.classList.toggle('is-viewer', Boolean(user) && !admin && !only)
+    app.classList.toggle('is-staff', Boolean(only))
 
-    const links = NAV.map(([key, label, href]) => `<a href="${href}"${key === active ? ' class="active"' : ''}>${label}</a>`).join('')
+    const links = NAV.filter(([key]) => !only || only.includes(key)).map(([key, label, href]) => `<a href="${href}"${key === active ? ' class="active"' : ''}>${label}</a>`).join('')
     const old = app.querySelector('.nav')
     if (old) {
       old.nextElementSibling.remove()
@@ -190,7 +196,7 @@ const UI = (() => {
     app.insertAdjacentHTML(
       'afterbegin',
       `<header class="nav">
-        <a class="logo" href="index.html">Stoplist</a>
+        <a class="logo" href="${API.roleHome() || 'index.html'}">Stoplist</a>
         <nav class="nav-links" aria-label="Основная навигация">${links}</nav>
         <div class="nav-actions">
           <span class="nav-user" title="${escapeHtml(user?.email || '')}">${escapeHtml(user?.name || 'Сессия определяется сервером')}</span>

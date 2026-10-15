@@ -46,45 +46,49 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/auth/login", a.rateLimited("login", 10, time.Minute, false, a.Login))
 	mux.HandleFunc("GET /api/auth/registration", a.Registration)
 
-	authed := func(method, path string, admin bool, handler http.HandlerFunc) {
-		mux.Handle(method+" "+path, a.protect(admin, handler))
+	// extra — роли сотрудников (официант, поставщик), которым маршрут открыт дополнительно:
+	// администратору доступно всё, менеджеру — всё, что не adminOnly, остальным — только extra.
+	authed := func(method, path string, admin bool, handler http.HandlerFunc, extra ...contract.Role) {
+		mux.Handle(method+" "+path, a.protect(admin, handler, extra...))
 	}
+	waiter, supplier := contract.RoleWaiter, contract.RoleSupplier
 
-	authed("POST", "/api/auth/logout", false, a.Logout)
-	authed("GET", "/api/auth/me", false, a.Me)
+	authed("POST", "/api/auth/logout", false, a.Logout, waiter, supplier)
+	authed("GET", "/api/auth/me", false, a.Me, waiter, supplier)
 	authed("GET", "/api/users", true, a.Users)
 	authed("POST", "/api/users/{id}/role", true, a.SetUserRole)
 	authed("POST", "/api/users", true, a.CreateManager)
 	authed("DELETE", "/api/users/{id}", true, a.DeleteManager)
 
 	// Каталог, остатки, меню, горячие предложения и аналитика кэшируются в Redis по ревизии данных.
-	authed("GET", "/api/products", false, a.cachedJSON("products", a.Products))
+	authed("GET", "/api/products", false, a.cachedJSON("products", a.Products), supplier)
 	authed("POST", "/api/products/{productId}/price", true, a.UpdateProductPrice)
 	authed("GET", "/api/requests", false, a.Requests)
 	authed("GET", "/api/requests/{id}", false, a.RequestByID)
 	authed("POST", "/api/requests", true, a.CreateRequest)
 	mux.Handle("POST /api/requests/parse", a.protectLongRunning(false, a.rateLimited("parse", 10, time.Minute, true, a.ParseRequestFile)))
-	authed("GET", "/api/jobs/{id}", false, a.Job)
+	authed("GET", "/api/jobs/{id}", false, a.Job, supplier)
 	authed("GET", "/api/stock", false, a.cachedJSON("stock", a.Stock))
 	authed("GET", "/api/stock/{productId}/batches", false, a.Batches)
 	authed("GET", "/api/expiry", false, a.Expiry)
 	authed("POST", "/api/batches/{id}/writeoff", true, a.WriteOffBatch)
-	authed("GET", "/api/supplies", false, a.Supplies)
-	authed("POST", "/api/supplies", true, a.CreateSupply)
-	mux.Handle("POST /api/supplies/parse", a.protectLongRunning(true, a.rateLimited("parse", 10, time.Minute, true, a.ParseSupplyFile)))
+	authed("GET", "/api/supplies", false, a.Supplies, supplier)
+	authed("POST", "/api/supplies", true, a.CreateSupply, supplier)
+	mux.Handle("POST /api/supplies/parse", a.protectLongRunning(true, a.rateLimited("parse", 10, time.Minute, true, a.ParseSupplyFile), supplier))
+	authed("POST", "/api/supplies/{id}/review", true, a.ReviewSupply, contract.RoleManager)
 	authed("DELETE", "/api/supplies/{id}", true, a.DeleteSupply)
 	authed("DELETE", "/api/supplies/{id}/items/{productId}", true, a.DeleteSupplyItem)
 
-	authed("GET", "/api/menu", false, a.cachedJSON("menu", a.Menu))
+	authed("GET", "/api/menu", false, a.cachedJSON("menu", a.Menu), waiter)
 	authed("POST", "/api/dishes", true, a.CreateDish)
 	authed("DELETE", "/api/dishes/{id}", true, a.DeleteDish)
 	authed("POST", "/api/dishes/{id}/price", true, a.UpdateDishPrice)
-	authed("POST", "/api/orders/validate", false, a.ValidateOrder)
-	authed("POST", "/api/orders", true, a.CreateOrder)
-	authed("GET", "/api/orders", false, a.Orders)
+	authed("POST", "/api/orders/validate", false, a.ValidateOrder, waiter)
+	authed("POST", "/api/orders", true, a.CreateOrder, waiter)
+	authed("GET", "/api/orders", false, a.Orders, waiter)
 
 	authed("GET", "/api/alerts", false, a.Alerts)
-	authed("GET", "/api/pulse", false, a.Pulse)
+	authed("GET", "/api/pulse", false, a.Pulse, waiter, supplier)
 	authed("GET", "/api/hot-offers", false, a.cachedJSON("hot-offers", a.HotOffers))
 	authed("GET", "/api/analytics", false, a.cachedJSON("analytics", a.Analytics))
 	mux.Handle("GET /api/analytics/ai", a.protectLongRunning(false, a.AnalyticsInsight))
@@ -99,7 +103,30 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("POST", "/api/demo/reset", true, a.DemoReset)
 }
 
-func (a *API) protect(adminOnly bool, next http.HandlerFunc) http.Handler {
+// roleAllowed: администратору доступно всё, менеджеру — маршруты без adminOnly,
+// официанту и поставщику — только маршруты, где их роль указана явно.
+func roleAllowed(role contract.Role, adminOnly bool, extra []contract.Role) bool {
+	if role == contract.RoleAdmin {
+		return true
+	}
+	for _, allowed := range extra {
+		if role == allowed {
+			return true
+		}
+	}
+	return role == contract.RoleManager && !adminOnly
+}
+
+// validRole — роль, с которой можно войти.
+func validRole(role string) bool {
+	switch contract.Role(role) {
+	case contract.RoleAdmin, contract.RoleManager, contract.RoleWaiter, contract.RoleSupplier:
+		return true
+	}
+	return false
+}
+
+func (a *API) protect(adminOnly bool, next http.HandlerFunc, extra ...contract.Role) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestMu.Lock()
 		defer requestMu.Unlock()
@@ -109,7 +136,7 @@ func (a *API) protect(adminOnly bool, next http.HandlerFunc) http.Handler {
 			a.writeError(w, http.StatusUnauthorized, "Требуется вход или срок сессии истёк")
 			return
 		}
-		if adminOnly && auth.User.Role != contract.RoleAdmin {
+		if !roleAllowed(auth.User.Role, adminOnly, extra) {
 			a.writeError(w, http.StatusForbidden, "Недостаточно прав для выполнения операции")
 			return
 		}
@@ -124,7 +151,7 @@ func (a *API) protect(adminOnly bool, next http.HandlerFunc) http.Handler {
 
 // protectLongRunning authenticates under the SQLite request lock, then releases it before
 // CPU/network-heavy work such as AI extraction. The handler only reads the catalogue afterwards.
-func (a *API) protectLongRunning(adminOnly bool, next http.HandlerFunc) http.Handler {
+func (a *API) protectLongRunning(adminOnly bool, next http.HandlerFunc, extra ...contract.Role) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestMu.Lock()
 		auth, err := a.authenticate(r)
@@ -133,7 +160,7 @@ func (a *API) protectLongRunning(adminOnly bool, next http.HandlerFunc) http.Han
 			a.writeError(w, http.StatusUnauthorized, "Требуется вход или срок сессии истёк")
 			return
 		}
-		if adminOnly && auth.User.Role != contract.RoleAdmin {
+		if !roleAllowed(auth.User.Role, adminOnly, extra) {
 			requestMu.Unlock()
 			a.writeError(w, http.StatusForbidden, "Недостаточно прав для выполнения операции")
 			return
@@ -185,7 +212,7 @@ func (a *API) authenticate(r *http.Request) (*authContext, error) {
 		var userID int64
 		var role string
 		if err := a.DB.QueryRow("SELECT id,name,email,role FROM accounts WHERE id=?", int64(idValue)).Scan(&userID, &user.Name, &user.Email, &role); err == nil &&
-			(role == string(contract.RoleAdmin) || role == string(contract.RoleManager)) {
+			validRole(role) {
 			user.ID = strconv.FormatInt(userID, 10)
 			user.Role = contract.Role(role)
 			return &authContext{User: user, TokenID: tokenID}, nil
@@ -208,7 +235,7 @@ func (a *API) authenticate(r *http.Request) (*authContext, error) {
 	if err != nil || !time.Now().UTC().Before(expiration) {
 		return nil, errors.New("session expired")
 	}
-	if role != string(contract.RoleAdmin) && role != string(contract.RoleManager) {
+	if !validRole(role) {
 		return nil, errors.New("invalid role")
 	}
 	a.rememberSession(tokenID, id, time.Until(expiration))
@@ -434,8 +461,8 @@ func (a *API) SetUserRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req contract.SetRoleRequest
-	if err := decodeJSON(w, r, &req); err != nil || (req.Role != contract.RoleAdmin && req.Role != contract.RoleManager) {
-		a.writeError(w, http.StatusBadRequest, "Выберите роль «admin» или «manager»")
+	if err := decodeJSON(w, r, &req); err != nil || !validRole(string(req.Role)) {
+		a.writeError(w, http.StatusBadRequest, "Выберите роль: admin, manager, waiter или supplier")
 		return
 	}
 	result, err := a.DB.Exec("UPDATE accounts SET role=? WHERE id=?", string(req.Role), id)
@@ -650,6 +677,14 @@ func (a *API) CreateManager(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "Пароль слишком длинный")
 		return
 	}
+	role := req.Role
+	if role == "" {
+		role = contract.RoleManager
+	}
+	if role != contract.RoleManager && role != contract.RoleWaiter && role != contract.RoleSupplier {
+		a.writeError(w, http.StatusBadRequest, "Роль сотрудника: менеджер, официант или поставщик")
+		return
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось создать пароль")
@@ -657,23 +692,23 @@ func (a *API) CreateManager(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := a.DB.Exec(
 		"INSERT INTO accounts(name,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
-		login, login, string(hash), string(contract.RoleManager), time.Now().UTC().Format(time.RFC3339Nano),
+		login, login, string(hash), string(role), time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "constraint") {
 			a.writeError(w, http.StatusConflict, "Пользователь с таким логином уже есть")
 			return
 		}
-		a.writeError(w, http.StatusInternalServerError, "Не удалось создать менеджера")
+		a.writeError(w, http.StatusInternalServerError, "Не удалось создать сотрудника")
 		return
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
-		a.writeError(w, http.StatusInternalServerError, "Не удалось создать менеджера")
+		a.writeError(w, http.StatusInternalServerError, "Не удалось создать сотрудника")
 		return
 	}
 	a.bumpRev()
-	a.sendJSON(w, http.StatusCreated, contract.User{ID: strconv.FormatInt(id, 10), Name: login, Email: login, Role: contract.RoleManager})
+	a.sendJSON(w, http.StatusCreated, contract.User{ID: strconv.FormatInt(id, 10), Name: login, Email: login, Role: role})
 }
 
 // DeleteManager удаляет менеджера вместе с его сессиями. Администраторов так удалить нельзя.
@@ -685,17 +720,17 @@ func (a *API) DeleteManager(w http.ResponseWriter, r *http.Request) {
 	}
 	// Сессии удаляются явно, не полагаясь только на каскад внешнего ключа.
 	a.forgetSessions(id)
-	if _, err := a.DB.Exec("DELETE FROM auth_sessions WHERE user_id IN (SELECT id FROM accounts WHERE id=? AND role=?)", id, string(contract.RoleManager)); err != nil {
+	if _, err := a.DB.Exec("DELETE FROM auth_sessions WHERE user_id IN (SELECT id FROM accounts WHERE id=? AND role<>'admin')", id); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить пользователя")
 		return
 	}
-	result, err := a.DB.Exec("DELETE FROM accounts WHERE id=? AND role=?", id, string(contract.RoleManager))
+	result, err := a.DB.Exec("DELETE FROM accounts WHERE id=? AND role<>'admin'", id)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить пользователя")
 		return
 	}
 	if affected, _ := result.RowsAffected(); affected == 0 {
-		a.writeError(w, http.StatusNotFound, "Менеджер не найден")
+		a.writeError(w, http.StatusNotFound, "Сотрудник не найден")
 		return
 	}
 	a.bumpRev()

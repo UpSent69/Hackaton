@@ -508,7 +508,7 @@
     .login-logo-text { font-size: 24px; }
   }
 </style>
-  <script src="motion.js?v=20261015-5"></script>
+  <script src="motion.js?v=20261015-7"></script>
 </head>
 <body>
 
@@ -602,7 +602,7 @@
   </div>
 </div>
 
-<script src="api.js?v=20261015-5"></script>
+<script src="api.js?v=20261015-7"></script>
 <script>
 // ===== СОЗДАНИЕ ЧАСТИЦ =====
 function createParticles() {
@@ -732,6 +732,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // ===== ПОСЛЕ ВХОДА =====
   // Куда вернуть пользователя: на страницу, с которой его отправили входить.
   function afterLogin() {
+    // Официант и поставщик всегда попадают на свою страницу.
+    if (API.roleHome()) return API.roleHome();
     const next = new URLSearchParams(location.search).get('next') || '';
     const pages = { stock: 'sclad.html', supplies: 'supplies.html', orders: 'orders.html', stoplist: 'stoplist.html', analytics: 'analytics.html' };
     if (pages[next]) return pages[next];
