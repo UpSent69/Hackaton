@@ -54,6 +54,7 @@ var restaurantFree = map[string]bool{
 	"GET /api/restaurants": true, "GET /api/jobs/{id}": true, "GET /api/pulse": true,
 	"GET /api/supplies": true, "POST /api/supplies": true,
 	"GET /api/demo/state": true, "POST /api/demo/clock": true, "POST /api/demo/advance": true,
+	"GET /api/chat": true, "POST /api/chat": true, "DELETE /api/chat/{id}": true,
 }
 
 // The warehouse demo is intentionally serialized. SQLite has one connection and this
@@ -80,6 +81,10 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("GET", "/api/auth/me", false, a.Me, waiter, supplier)
 	authed("GET", "/api/users", true, a.Users)
 	authed("GET", "/api/restaurants", false, a.Restaurants, waiter, supplier)
+	// Общий чат сети — для всех ролей.
+	authed("GET", "/api/chat", false, a.ChatMessages, waiter, supplier)
+	authed("POST", "/api/chat", false, a.SendChatMessage, waiter, supplier)
+	authed("DELETE", "/api/chat/{id}", false, a.DeleteChatMessage, waiter, supplier)
 	authed("POST", "/api/users", true, a.CreateManager)
 	authed("DELETE", "/api/users/{id}", true, a.DeleteManager)
 

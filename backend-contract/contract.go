@@ -388,6 +388,19 @@ type HotOffer struct {
 	Reasons           []HotReason `json:"reasons"` // по убыванию Weight, первая — главная
 }
 
+// ChatMessage — сообщение общего чата сети. Role — должность автора (на фронте — первая буква),
+// Restaurant — его ресторан или «Вся сеть» у владельца и поставщика.
+type ChatMessage struct {
+	ID         string    `json:"id"`
+	Author     string    `json:"author"`
+	Role       Role      `json:"role"`
+	Restaurant string    `json:"restaurant"`
+	Text       string    `json:"text"`
+	At         time.Time `json:"at"`
+	Mine       bool      `json:"mine"`
+	CanDelete  bool      `json:"canDelete"` // своё сообщение или пользователь — владелец
+}
+
 // CreateHotOfferRequest — ручное горячее предложение. Официант создаёт его на рассмотрение
 // менеджеру; менеджер, директор и владелец — сразу действующим.
 type CreateHotOfferRequest struct {

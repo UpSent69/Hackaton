@@ -174,6 +174,9 @@ func Init(dbPath string) (*sql.DB, error) {
 			"dish_id INTEGER NOT NULL REFERENCES dishes(id) ON DELETE CASCADE, reason TEXT NOT NULL, " +
 			"target_portions INTEGER NOT NULL, until TEXT NOT NULL, status TEXT NOT NULL, hidden INTEGER NOT NULL DEFAULT 0, " +
 			"created_by INTEGER NULL, created_at TEXT NOT NULL, reviewed_at TEXT NULL);" +
+			"CREATE TABLE IF NOT EXISTS chat_messages (" +
+			"id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, author_name TEXT NOT NULL, role TEXT NOT NULL, " +
+			"restaurant_name TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL);" +
 			"CREATE TABLE IF NOT EXISTS hot_offer_overrides (" +
 			"restaurant_id INTEGER NOT NULL, offer_id TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('hidden','deleted')), " +
 			"created_at TEXT NOT NULL, PRIMARY KEY(restaurant_id, offer_id));",
