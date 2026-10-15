@@ -252,9 +252,16 @@
 
         async function loadInsight(refresh) {
           aiRefresh.disabled = true
-          aiBody.innerHTML = '<div class="ai-wait"><span class="spinner"></span>Qwen анализирует статистику — это может занять до минуты…</div>'
+          aiBody.innerHTML = '<div class="ai-wait"><span class="spinner"></span>Qwen анализирует статистику… Если модель только запускается, это может занять пару минут.</div>'
           try {
-            const insight = await UI.call(API.get('/analytics/ai' + (refresh ? '?refresh=1' : '')))
+            // Анализ идёт на сервере в фоне: пока он не готов, сервер отвечает «pending».
+            let insight = await UI.call(API.get('/analytics/ai' + (refresh ? '?refresh=1' : '')))
+            const started = Date.now()
+            while (insight && insight.status === 'pending') {
+              if (Date.now() - started > 4 * 60 * 1000) throw new Error('Qwen не ответила за 4 минуты. Попробуйте обновить анализ.')
+              await new Promise((resolve) => setTimeout(resolve, 2500))
+              insight = await UI.call(API.get('/analytics/ai?poll=1'))
+            }
             aiBody.innerHTML = `${insight.summary ? `<p class="ai-summary rise">${escapeHtml(insight.summary)}</p>` : ''}
               <div class="ai-cols rise" style="--i:1">${aiList('Риски', insight.risks || [])}${aiList('Что сделать', insight.actions || [])}</div>
               <div class="ai-season rise" style="--i:2">

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
@@ -58,6 +59,26 @@ type ollamaRequest struct {
 	Format   string          `json:"format"`
 	Think    bool            `json:"think"`
 	Options  map[string]any  `json:"options"`
+	// Сколько Ollama держит модель в памяти после запроса. По умолчанию 5 минут, и после
+	// перерыва первый запрос ждёт загрузку модели заново — это может занять больше минуты.
+	KeepAlive string `json:"keep_alive,omitempty"`
+}
+
+const ollamaKeepAlive = "30m"
+
+// Warmup заранее загружает модель в память Ollama, чтобы первый анализ после запуска
+// сервера не ждал загрузку. Ошибка не мешает работе: Ollama может быть ещё не запущена.
+func Warmup(baseURL, model string) {
+	body, _ := json.Marshal(map[string]any{"model": model, "keep_alive": ollamaKeepAlive})
+	client := &http.Client{Timeout: 3 * time.Minute}
+	started := time.Now()
+	resp, err := client.Post(strings.TrimRight(baseURL, "/")+"/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("Ollama: не удалось заранее загрузить модель %s: %v", model, err)
+		return
+	}
+	resp.Body.Close()
+	log.Printf("Ollama: модель %s загружена заранее за %s (HTTP %d)", model, time.Since(started).Round(time.Second), resp.StatusCode)
 }
 
 type ollamaResponse struct {
@@ -175,6 +196,7 @@ func Analyze(ctx context.Context, source Source, baseURL, model string) (Documen
 			"temperature": 0,
 			"num_predict": 256,
 		},
+		KeepAlive: ollamaKeepAlive,
 	})
 	if err != nil {
 		return Document{}, err

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"auth-service/internal/contract"
+	"auth-service/internal/requestimport"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -82,6 +83,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("GET", "/api/hot-offers", false, a.HotOffers)
 	authed("GET", "/api/analytics", false, a.Analytics)
 	mux.Handle("GET /api/analytics/ai", a.protectLongRunning(false, a.AnalyticsInsight))
+	go requestimport.Warmup(requestimport.OllamaConfig())
 
 	authed("GET", "/api/demo/state", false, a.DemoState)
 	authed("POST", "/api/demo/clock", true, a.DemoClock)

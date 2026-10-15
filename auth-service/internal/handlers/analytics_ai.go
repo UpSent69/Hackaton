@@ -29,18 +29,42 @@ type analyticsInsightResponse struct {
 }
 
 // Анализ модели живёт до следующего изменения данных: автообновление страницы
-// не должно каждый раз запускать нейросеть. Генерации идут по одной.
+// не должно каждый раз запускать нейросеть.
+//
+// Сам анализ идёт в фоне: после перерыва Ollama сначала загружает модель в память, и ответ
+// может прийти позже, чем nginx держит запрос (60 с). Поэтому маршрут сразу отвечает 202
+// «считается», а страница переспрашивает с ?poll=1, пока не получит результат.
 var (
-	insightMu    sync.Mutex
-	insightRev   int64 = -1
-	insightCache analyticsInsightResponse
+	insightMu      sync.Mutex
+	insightRev     int64 = -1
+	insightCache   analyticsInsightResponse
+	insightRunning bool
+	insightErr     string // ошибка последнего фонового анализа; сбрасывается при новом запуске
 )
 
-// AnalyticsInsight передаёт локальной Qwen ту же статистику, что показывает вкладка
-// «Аналитика», и возвращает её выводы. ?refresh=1 — пересчитать, даже если данные не менялись.
+const insightTimeout = 3 * time.Minute
+
+// AnalyticsInsight передаёт локальной Qwen ту же статистику, что показывает вкладка «Аналитика».
+// Без параметров — свежий анализ из памяти или запуск нового; ?refresh=1 — пересчитать
+// принудительно; ?poll=1 — только узнать, готов ли запущенный анализ (новый не запускается).
 func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 	insightMu.Lock()
 	defer insightMu.Unlock()
+	pending := map[string]string{"status": "pending"}
+
+	if r.URL.Query().Get("poll") == "1" {
+		switch {
+		case insightRunning:
+			a.sendJSON(w, http.StatusAccepted, pending)
+		case insightErr != "":
+			a.writeError(w, http.StatusInternalServerError, insightErr)
+		case insightRev >= 0:
+			a.sendJSON(w, http.StatusOK, insightCache)
+		default:
+			a.writeError(w, http.StatusConflict, "Анализ не запущен — нажмите «Обновить анализ»")
+		}
+		return
+	}
 
 	refresh := r.URL.Query().Get("refresh") == "1"
 	requestMu.Lock()
@@ -50,6 +74,11 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 		cached := insightCache
 		cached.Cached = true
 		a.sendJSON(w, http.StatusOK, cached)
+		return
+	}
+	if insightRunning {
+		requestMu.Unlock()
+		a.sendJSON(w, http.StatusAccepted, pending)
 		return
 	}
 	facts, hasData, menuNames, err := a.analyticsFacts(r)
@@ -64,26 +93,51 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	insightRunning = true
+	insightErr = ""
+	go a.generateInsight(rev, facts, menuNames, now)
+	a.sendJSON(w, http.StatusAccepted, pending)
+}
+
+func (a *API) generateInsight(rev int64, facts string, menuNames []string, now time.Time) {
 	baseURL, model := requestimport.OllamaConfig()
-	ctx, cancel := context.WithTimeout(r.Context(), 52*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), insightTimeout)
 	defer cancel()
 	started := time.Now()
 	insight, err := requestimport.AnalyzeStats(ctx, facts, baseURL, model)
 	log.Printf("Аналитика Qwen: время=%s, ошибка=%v", time.Since(started), err)
+
+	insightMu.Lock()
+	defer insightMu.Unlock()
+	insightRunning = false
 	if err != nil {
-		a.writeError(w, http.StatusInternalServerError, "Qwen не ответила: "+err.Error())
+		insightErr = friendlyOllamaError(err, model)
 		return
 	}
-
 	menuPicks := onlyMenuDishes(insight.MenuPicks, menuNames)
-	log.Printf("Аналитика Qwen: блюд из меню предложено %d, совпало с меню %d: %q", len(insight.MenuPicks), len(menuPicks), []string(insight.MenuPicks))
+	log.Printf("Аналитика Qwen: блюд из меню предложено %d, совпало с меню %d", len(insight.MenuPicks), len(menuPicks))
 	insightCache = analyticsInsightResponse{
 		Summary: insight.Summary, Risks: insight.Risks, Actions: insight.Actions,
 		Season: insight.Season, MenuPicks: menuPicks, NewDishes: insight.NewDishes,
 		Model: model, GeneratedAt: now,
 	}
 	insightRev = rev
-	a.sendJSON(w, http.StatusOK, insightCache)
+}
+
+// friendlyOllamaError объясняет частые причины на компьютере, где Ollama настроена иначе.
+func friendlyOllamaError(err error, model string) string {
+	text := err.Error()
+	lower := strings.ToLower(text)
+	switch {
+	case strings.Contains(lower, "connection refused") || strings.Contains(lower, "no such host") || strings.Contains(lower, "connectex"):
+		return "Qwen недоступна: Ollama не запущена или не принимает подключения из Docker. На компьютере с Ollama задайте OLLAMA_HOST=0.0.0.0:11434 и перезапустите её (см. REQUESTS_AI.md)."
+	case strings.Contains(lower, "http 404") || (strings.Contains(lower, "model") && strings.Contains(lower, "not found")):
+		return fmt.Sprintf("Модель %s не скачана в Ollama: выполните «ollama pull %s» и обновите анализ.", model, model)
+	case strings.Contains(lower, "deadline exceeded") || strings.Contains(lower, "timeout"):
+		return "Qwen не успела ответить за 3 минуты: компьютер с Ollama перегружен или слишком медленный. Попробуйте ещё раз."
+	default:
+		return "Qwen не ответила: " + text
+	}
 }
 
 // analyticsFacts собирает статистику вкладки «Аналитика», склада и горячих предложений

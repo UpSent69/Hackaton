@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 )
 
 // Insight is the model's reading of the warehouse statistics shown on the analytics page.
@@ -116,7 +115,8 @@ func AnalyzeStats(ctx context.Context, facts string, baseURL, model string) (Ins
 		Stream:  false,
 		Format:  "json",
 		Think:   false,
-		Options: map[string]any{"temperature": 0.2, "num_predict": 1400},
+		Options:   map[string]any{"temperature": 0.2, "num_predict": 1400},
+		KeepAlive: ollamaKeepAlive,
 	})
 	if err != nil {
 		return Insight{}, err
@@ -127,8 +127,7 @@ func AnalyzeStats(ctx context.Context, facts string, baseURL, model string) (Ins
 		return Insight{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 50 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return Insight{}, fmt.Errorf("Ollama недоступен: %w", err)
 	}

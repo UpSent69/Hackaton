@@ -76,6 +76,7 @@ func AnalyzeSupply(ctx context.Context, source Source, baseURL, model string) (S
 			// A delivery usually has many rows, so the answer is longer than for a request.
 			"num_predict": 1536,
 		},
+		KeepAlive: ollamaKeepAlive,
 	})
 	if err != nil {
 		return SupplyDocument{}, err
