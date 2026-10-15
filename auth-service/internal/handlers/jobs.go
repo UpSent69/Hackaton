@@ -27,7 +27,8 @@ const (
 )
 
 type documentJob struct {
-	ID       string `json:"id"`
+	ID           string `json:"id"`
+	RestaurantID int64  `json:"restaurantId"` // каталог и меню какого ресторана сопоставлять
 	Kind     string `json:"kind"` // "supply" или "request"
 	Filename string `json:"filename"`
 	Hash     string `json:"hash"`
@@ -64,8 +65,8 @@ func newJobID() string {
 }
 
 // enqueueDocument публикует документ в Kafka и отвечает 202 с номером задачи.
-func (a *API) enqueueDocument(w http.ResponseWriter, kind, filename, hash string, source requestimport.Source) {
-	job := documentJob{ID: newJobID(), Kind: kind, Filename: filename, Hash: hash, Text: source.Text, Image: source.Image, MIME: source.ImageMIME}
+func (a *API) enqueueDocument(w http.ResponseWriter, restaurantID int64, kind, filename, hash string, source requestimport.Source) {
+	job := documentJob{ID: newJobID(), RestaurantID: restaurantID, Kind: kind, Filename: filename, Hash: hash, Text: source.Text, Image: source.Image, MIME: source.ImageMIME}
 	if err := a.Bus.Publish(context.Background(), events.TopicDocumentJobs, job.ID, job); err != nil {
 		log.Printf("Очередь документов: Kafka недоступна: %v", err)
 		a.writeError(w, http.StatusServiceUnavailable, "Сервис распознавания временно недоступен, попробуйте через минуту")
@@ -143,9 +144,9 @@ func (a *API) processDocument(value []byte) {
 	recorder := httptest.NewRecorder()
 	source := requestimport.Source{Text: job.Text, Image: job.Image, ImageMIME: job.MIME}
 	if job.Kind == "supply" {
-		a.finishSupplyParse(ctx, recorder, job.Filename, job.Hash, source)
+		a.finishSupplyParse(ctx, recorder, job.RestaurantID, job.Filename, job.Hash, source)
 	} else {
-		a.finishRequestParse(ctx, recorder, job.Filename, job.Hash, source)
+		a.finishRequestParse(ctx, recorder, job.RestaurantID, job.Filename, job.Hash, source)
 	}
 	result := documentResult{JobID: job.ID, jobResult: jobResult{Status: recorder.Code, Body: json.RawMessage(recorder.Body.Bytes())}}
 	log.Printf("Распознавание: задача %s (%s) готова за %s, HTTP %d", job.ID, job.Kind, time.Since(started).Round(time.Second), result.Status)

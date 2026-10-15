@@ -40,8 +40,9 @@ const (
 type Role string
 
 const (
-	RoleAdmin  Role = "admin"
-	RoleManager Role = "manager" // менеджер: видит все данные, но не меняет их
+	RoleOwner    Role = "owner"    // владелец сети: входит в любой из трёх ресторанов с полными правами
+	RoleDirector Role = "director" // директор: полные права, но только в своём ресторане
+	RoleManager  Role = "manager"  // менеджер: видит данные своего ресторана, рассматривает поставки
 	RoleWaiter   Role = "waiter"   // официант: только страница «Заказы» — меню и оформление заказов
 	RoleSupplier Role = "supplier" // поставщик: только страница «Поставки» — приёмка и импорт
 )
@@ -61,7 +62,6 @@ type RegisterRequest struct {
 	Name     string `json:"name"`
 	Email    string `json:"email"`
 	Password string `json:"password"` // не короче 6 символов
-	Role     Role   `json:"role,omitempty"` // manager (по умолчанию), waiter или supplier
 }
 
 type LoginRequest struct {
@@ -73,7 +73,10 @@ type LoginRequest struct {
 type CreateManagerRequest struct {
 	Login    string `json:"login"`    // латиница, цифры, «.», «_», «-», от 3 до 64 символов
 	Password string `json:"password"` // не короче 6 символов
-	Role     Role   `json:"role,omitempty"` // manager (по умолчанию), waiter или supplier
+	Role     Role   `json:"role,omitempty"` // director, manager (по умолчанию), waiter или supplier
+	// Ресторан сотрудника: обязателен для директора, менеджера и официанта, если создаёт владелец
+	// (директор всегда создаёт сотрудников своего ресторана); у поставщика не указывается.
+	RestaurantID string `json:"restaurantId,omitempty"`
 }
 
 // RegistrationState — открыта ли самостоятельная регистрация (только для первых двух администраторов).
@@ -93,6 +96,16 @@ type User struct {
 	Name  string `json:"name"`
 	Email string `json:"email"`
 	Role  Role   `json:"role"`
+	// Ресторан сотрудника. У владельца и поставщика пусто: они работают со всеми ресторанами.
+	RestaurantID   string `json:"restaurantId,omitempty"`
+	RestaurantName string `json:"restaurantName,omitempty"`
+}
+
+// Restaurant — ресторан сети. Ресторан запроса передаётся заголовком X-Restaurant-Id
+// (его учитывают только у владельца и поставщика; остальные всегда работают в своём).
+type Restaurant struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type SetRoleRequest struct {
@@ -148,6 +161,9 @@ type CreateSupplyRequest struct {
 	Number   string            `json:"number"`             // номер поставки, уникален
 	Items    []SupplyItemInput `json:"items"`              // не пустой
 	ImportID string            `json:"importId,omitempty"` // id из POST /supplies/parse, если строки распознаны из файла
+	// Ресторан, в который поставщик отправляет поставку. Остальные роли создают поставку
+	// в ресторане запроса, поле не нужно.
+	RestaurantID string `json:"restaurantId,omitempty"`
 }
 
 // SupplyItemInput — строка поставки. Продукт находится по названию без учёта регистра и «ё/е»;
@@ -171,6 +187,9 @@ type Supply struct {
 	Comment    string               `json:"comment"`              // комментарий проверяющего
 	ReviewedAt *time.Time           `json:"reviewedAt,omitempty"` // когда рассмотрена
 	Proposed   []SupplyProposedItem `json:"proposed"`             // позиции, отправленные поставщиком на проверку
+
+	RestaurantID   string `json:"restaurantId"`
+	RestaurantName string `json:"restaurantName"`
 }
 
 // SupplyStatus — состояние поставки. Поставка администратора сразу accepted;

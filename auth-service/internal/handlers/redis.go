@@ -252,7 +252,7 @@ func (a *API) cachedJSON(name string, next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-		key := "cache:" + name + ":" + strconv.FormatInt(a.currentRev(), 10) + ":" + r.URL.RawQuery
+		key := "cache:" + name + ":" + strconv.FormatInt(restaurantOf(r), 10) + ":" + strconv.FormatInt(a.currentRev(), 10) + ":" + r.URL.RawQuery
 		if body, ok := a.KV.Get(key); ok {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.Header().Set("X-Cache", "HIT")

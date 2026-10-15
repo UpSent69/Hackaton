@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Stoplist — Вход</title>
+<title>Checklist — Вход</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -436,6 +436,24 @@
   }
 
   /* Пульсирующая точка */
+  /* «Назад» — в левом верхнем углу страницы: у страницы входа нет шапки */
+  .back-btn {
+    position: fixed;
+    top: 24px; left: 24px;
+    z-index: 10;
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 16px;
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    background: rgba(19,19,22,0.8);
+    color: var(--text-secondary);
+    font: 500 13px var(--font-main);
+    text-decoration: none;
+    cursor: pointer;
+    transition: color 0.2s var(--ease), border-color 0.2s var(--ease), background 0.2s var(--ease);
+  }
+  .back-btn:hover { color: var(--text-primary); border-color: var(--text-muted); background: var(--bg-card-hover); }
+
   .status-indicator {
     position: absolute;
     top: 24px;
@@ -508,9 +526,13 @@
     .login-logo-text { font-size: 24px; }
   }
 </style>
-  <script src="motion.js?v=20261015-7"></script>
+  <script src="motion.js?v=20261015-14"></script>
 </head>
 <body>
+<a class="back-btn" id="backBtn" href="index.html" aria-label="Назад">
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+  Назад
+</a>
 
 <!-- Анимированный фон -->
 <div class="bg-scene">
@@ -538,7 +560,7 @@
 
     <!-- Логотип -->
     <div class="login-logo">
-      <div class="login-logo-text">Stoplist</div>
+      <div class="login-logo-text">Checklist</div>
       <div class="login-logo-sub">Склад ресторана</div>
     </div>
 
@@ -602,7 +624,7 @@
   </div>
 </div>
 
-<script src="api.js?v=20261015-7"></script>
+<script src="api.js?v=20261015-14"></script>
 <script>
 // ===== СОЗДАНИЕ ЧАСТИЦ =====
 function createParticles() {
@@ -714,6 +736,7 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       // Вход идёт через общий слой api.js — тот же, которым пользуются остальные страницы,
       // поэтому сессия сразу видна везде.
+      API.clearSession();
       API.setSession(await API.post('/auth/login', { email: username, password: password }));
       window.location.href = afterLogin();
 
@@ -732,14 +755,25 @@ document.addEventListener('DOMContentLoaded', () => {
   // ===== ПОСЛЕ ВХОДА =====
   // Куда вернуть пользователя: на страницу, с которой его отправили входить.
   function afterLogin() {
-    // Официант и поставщик всегда попадают на свою страницу.
+    // Официант и поставщик всегда попадают на свою страницу, владелец — на выбор ресторана.
     if (API.roleHome()) return API.roleHome();
+    if (API.getUser() && API.getUser().role === 'owner') return 'app.html#/restaurants';
     const next = new URLSearchParams(location.search).get('next') || '';
     const pages = { stock: 'sclad.html', supplies: 'supplies.html', orders: 'orders.html', stoplist: 'stoplist.html', analytics: 'analytics.html' };
     if (pages[next]) return pages[next];
     // Допускаются только названия экранов — никаких произвольных адресов.
     return /^[a-z-]+$/.test(next) ? 'app.html#/' + next : 'index.html';
   }
+
+  // «Назад» возвращает на страницу сайта, с которой пришли; если пришли не с сайта — на главную.
+  document.getElementById('backBtn').addEventListener('click', (event) => {
+    let fromSite = false;
+    try { fromSite = document.referrer && new URL(document.referrer).origin === location.origin; } catch {}
+    if (fromSite && history.length > 1) {
+      event.preventDefault();
+      history.back();
+    }
+  });
 
   document.addEventListener('DOMContentLoaded', () => {
     const form = document.getElementById('loginForm');
@@ -751,7 +785,7 @@ document.addEventListener('DOMContentLoaded', () => {
       .then((state) => {
         hint.innerHTML = state.open
           ? 'Нет аккаунта? <a href="app.html#/register" style="color:#fff">Зарегистрироваться</a>'
-          : 'Нет аккаунта? Его выдаёт администратор.';
+          : 'Нет аккаунта? Его выдаёт владелец или директор ресторана.';
       })
       .catch(() => {});
 

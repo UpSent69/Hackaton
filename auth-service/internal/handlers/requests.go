@@ -106,8 +106,9 @@ type savedRequest struct {
 	Items                 []savedRequestItem `json:"items"`
 }
 
-func (a *API) requestCatalog() ([]requestCatalogProduct, error) {
-	rows, err := a.DB.Query("SELECT id,name,unit,base_price_kopecks FROM products ORDER BY name COLLATE NOCASE")
+// requestCatalog — продукты склада ресторана с ценой и доступным остатком.
+func (a *API) requestCatalog(restaurantID int64) ([]requestCatalogProduct, error) {
+	rows, err := a.DB.Query("SELECT id,name,unit,base_price_kopecks FROM products WHERE restaurant_id=? ORDER BY name COLLATE NOCASE", restaurantID)
 	if err != nil {
 		return nil, err
 	}
@@ -219,18 +220,18 @@ func (a *API) ParseRequestFile(w http.ResponseWriter, r *http.Request) {
 			for _, item := range document.Items {
 				names = append(names, item.ProductName)
 			}
-			if !needsModelMatch(names, a.dishNames()) {
-				a.finishRequestParse(r.Context(), w, filename, hashHex, source)
+			if !needsModelMatch(names, a.dishNames(restaurantOf(r))) {
+				a.finishRequestParse(r.Context(), w, restaurantOf(r), filename, hashHex, source)
 				return
 			}
 		}
 	}
-	a.enqueueDocument(w, "request", filename, hashHex, source)
+	a.enqueueDocument(w, restaurantOf(r), "request", filename, hashHex, source)
 }
 
 // finishRequestParse распознаёт заявку и сопоставляет позиции с каталогом. Заявка здесь
 // не сохраняется. Вызывается из запроса (простые списки) или из очереди документов.
-func (a *API) finishRequestParse(ctx context.Context, w http.ResponseWriter, filename, hashHex string, source requestimport.Source) {
+func (a *API) finishRequestParse(ctx context.Context, w http.ResponseWriter, restaurantID int64, filename, hashHex string, source requestimport.Source) {
 	baseURL, model := requestimport.OllamaConfig()
 	warnings := make([]string, 0)
 	var document requestimport.Document
@@ -284,7 +285,7 @@ func (a *API) finishRequestParse(ctx context.Context, w http.ResponseWriter, fil
 		// A text-based PDF was extracted. Scanned pages are rejected by Extract with a clear message.
 	}
 
-	dishes, err := a.menuDishes()
+	dishes, err := a.menuDishes(restaurantID)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить меню")
 		return
@@ -329,7 +330,7 @@ func (a *API) finishRequestParse(ctx context.Context, w http.ResponseWriter, fil
 		warnings = append(warnings, "Этих блюд нет в меню: "+strings.Join(requestimport.SortedKeys(notInMenu), ", ")+". Выберите замену из меню или удалите строку.")
 	}
 	duplicate := false
-	if err := a.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM customer_requests WHERE source_sha256=?)", hashHex).Scan(&duplicate); err != nil {
+	if err := a.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM customer_requests WHERE source_sha256=? AND restaurant_id=?)", hashHex, restaurantID).Scan(&duplicate); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось проверить повторную загрузку")
 		return
 	}
@@ -419,7 +420,7 @@ func (a *API) UpdateProductPrice(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "Цена должна быть от 0 до 10 000 000 000 ₽")
 		return
 	}
-	result, err := a.DB.Exec("UPDATE products SET base_price_kopecks=? WHERE id=?", input.PriceKopecks, productID)
+	result, err := a.DB.Exec("UPDATE products SET base_price_kopecks=? WHERE id=? AND restaurant_id=?", input.PriceKopecks, productID, restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось обновить цену")
 		return
@@ -453,7 +454,7 @@ func (a *API) UpdateDishPrice(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "Цена должна быть от 0 до 10 000 000 000 ₽")
 		return
 	}
-	result, err := a.DB.Exec("UPDATE dishes SET price_kopecks=? WHERE id=?", input.PriceKopecks, dishID)
+	result, err := a.DB.Exec("UPDATE dishes SET price_kopecks=? WHERE id=? AND restaurant_id=?", input.PriceKopecks, dishID, restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось обновить цену")
 		return
@@ -469,10 +470,10 @@ func (a *API) UpdateDishPrice(w http.ResponseWriter, r *http.Request) {
 }
 
 // dishNames — названия блюд меню.
-func (a *API) dishNames() []string {
+func (a *API) dishNames(restaurantID int64) []string {
 	requestMu.Lock()
 	defer requestMu.Unlock()
-	rows, err := a.DB.Query("SELECT name FROM dishes ORDER BY name COLLATE NOCASE")
+	rows, err := a.DB.Query("SELECT name FROM dishes WHERE restaurant_id=? ORDER BY name COLLATE NOCASE", restaurantID)
 	if err != nil {
 		return nil
 	}
@@ -520,7 +521,7 @@ func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.SourceHash != "" {
 		var duplicate int
-		if err := a.DB.QueryRow("SELECT id FROM customer_requests WHERE source_sha256=?", input.SourceHash).Scan(&duplicate); err == nil {
+		if err := a.DB.QueryRow("SELECT id FROM customer_requests WHERE source_sha256=? AND restaurant_id=?", input.SourceHash, restaurantOf(r)).Scan(&duplicate); err == nil {
 			a.writeError(w, http.StatusConflict, "Заявка из этого файла уже сохранена")
 			return
 		} else if !errors.Is(err, sql.ErrNoRows) {
@@ -539,8 +540,8 @@ func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	tempNumber := fmt.Sprintf("TMP-%d", now.UnixNano())
 	result, err := tx.Exec(
-		"INSERT INTO customer_requests(request_number,customer_name,source_filename,source_sha256,global_discount_percent,subtotal_kopecks,total_kopecks,created_at,status) VALUES(?,?,?,?,?,0,0,?,'saved')",
-		tempNumber, input.CustomerName, input.SourceFilename, input.SourceHash, input.GlobalDiscountPercent, now.Format(time.RFC3339Nano),
+		"INSERT INTO customer_requests(request_number,customer_name,source_filename,source_sha256,global_discount_percent,subtotal_kopecks,total_kopecks,created_at,status,restaurant_id) VALUES(?,?,?,?,?,0,0,?,'saved',?)",
+		tempNumber, input.CustomerName, input.SourceFilename, input.SourceHash, input.GlobalDiscountPercent, now.Format(time.RFC3339Nano), restaurantOf(r),
 	)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -580,7 +581,7 @@ func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 
 		var dishName string
 		var price sql.NullInt64
-		if err := tx.QueryRow("SELECT name,price_kopecks FROM dishes WHERE id=?", dishID).Scan(&dishName, &price); err != nil {
+		if err := tx.QueryRow("SELECT name,price_kopecks FROM dishes WHERE id=? AND restaurant_id=?", dishID, restaurantOf(r)).Scan(&dishName, &price); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				a.writeError(w, http.StatusBadRequest, "Одно из выбранных блюд больше нет в меню")
 			} else {
@@ -642,7 +643,7 @@ func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) Requests(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.DB.Query("SELECT id FROM customer_requests ORDER BY id DESC LIMIT 100")
+	rows, err := a.DB.Query("SELECT id FROM customer_requests WHERE restaurant_id=? ORDER BY id DESC LIMIT 100", restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить историю заявок")
 		return
@@ -680,6 +681,11 @@ func (a *API) RequestByID(w http.ResponseWriter, r *http.Request) {
 	id, err := parseID(r.PathValue("id"))
 	if err != nil {
 		a.writeError(w, http.StatusBadRequest, "Некорректный номер заявки")
+		return
+	}
+	var owned int
+	if err := a.DB.QueryRow("SELECT COUNT(*) FROM customer_requests WHERE id=? AND restaurant_id=?", id, restaurantOf(r)).Scan(&owned); err != nil || owned == 0 {
+		a.writeError(w, http.StatusNotFound, "Заявка не найдена")
 		return
 	}
 	item, err := a.loadSavedRequest(id)

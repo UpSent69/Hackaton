@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -160,6 +161,11 @@ func Init(dbPath string) (*sql.DB, error) {
 	); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate legacy administrators: %w", err)
+	}
+
+	if err := migrateRestaurants(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate restaurants: %w", err)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -324,6 +330,155 @@ func migrateStaffRoles(db *sql.DB) error {
 			"id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE, " +
 			"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager','waiter','supplier')), created_at TEXT NOT NULL)",
 		"INSERT INTO accounts_new(id,name,email,password_hash,role,created_at) SELECT id,name,email,password_hash,role,created_at FROM accounts",
+		"DROP TABLE accounts",
+		"ALTER TABLE accounts_new RENAME TO accounts",
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// Сеть из трёх ресторанов. Данные каждого ресторана (продукты, поставки, партии, меню,
+// заказы, заявки, уведомления) привязаны к нему через restaurant_id корневых таблиц;
+// дочерние таблицы (партии, состав блюд, позиции заказов) наследуют ресторан через связи.
+// Всё, что было в базе до разделения, отходит ресторану 1.
+var restaurantNames = []string{"ресторан-1", "ресторан-2", "ресторан-3"}
+
+func migrateRestaurants(db *sql.DB) error {
+	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS restaurants (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"); err != nil {
+		return err
+	}
+	for i, name := range restaurantNames {
+		if _, err := db.Exec("INSERT OR IGNORE INTO restaurants(id,name) VALUES(?,?)", i+1, name); err != nil {
+			return err
+		}
+	}
+	// Уникальность названий и номеров теперь в пределах ресторана: «Томаты» есть в каждом.
+	rebuilds := []struct {
+		table, column, unique string
+	}{
+		{"products", "norm_name TEXT NOT NULL UNIQUE", "UNIQUE(restaurant_id, norm_name)"},
+		{"supplies", "number TEXT NOT NULL UNIQUE", "UNIQUE(restaurant_id, number)"},
+		{"dishes", "name TEXT NOT NULL UNIQUE COLLATE NOCASE", "UNIQUE(restaurant_id, name)"},
+		{"orders", "order_number INTEGER NOT NULL UNIQUE", "UNIQUE(restaurant_id, order_number)"},
+	}
+	for _, rebuild := range rebuilds {
+		if err := addRestaurantWithUnique(db, rebuild.table, rebuild.column, rebuild.unique); err != nil {
+			return fmt.Errorf("%s: %w", rebuild.table, err)
+		}
+	}
+	for _, table := range []string{"alerts", "customer_requests", "supply_imports"} {
+		if err := ensureColumn(db, table, "restaurant_id", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return fmt.Errorf("%s: %w", table, err)
+		}
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);" +
+		"CREATE INDEX IF NOT EXISTS idx_alerts_restaurant ON alerts(restaurant_id, id DESC);"); err != nil {
+		return err
+	}
+	return migrateOwnerRoles(db)
+}
+
+var createTableName = regexp.MustCompile(`^CREATE TABLE\s+"?(\w+)"?\s*\(`)
+
+// addRestaurantWithUnique пересоздаёт таблицу: убирает глобальную уникальность столбца
+// и добавляет restaurant_id с уникальностью в пределах ресторана. Данные и id сохраняются.
+func addRestaurantWithUnique(db *sql.DB, table, uniqueColumn, unique string) error {
+	var schema string
+	if err := db.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&schema); err != nil {
+		return err
+	}
+	if strings.Contains(schema, "restaurant_id") {
+		return nil
+	}
+	if !strings.Contains(schema, uniqueColumn) {
+		return fmt.Errorf("неожиданная схема: %s", schema)
+	}
+	columns, err := tableColumns(db, table)
+	if err != nil {
+		return err
+	}
+	newSchema := strings.Replace(schema, uniqueColumn, strings.Replace(uniqueColumn, " UNIQUE", "", 1), 1)
+	newSchema = createTableName.ReplaceAllString(newSchema, "CREATE TABLE "+table+"_new (")
+	end := strings.LastIndex(newSchema, ")")
+	newSchema = newSchema[:end] + ", restaurant_id INTEGER NOT NULL DEFAULT 1 REFERENCES restaurants(id), " + unique + ")"
+
+	if _, err := db.Exec("PRAGMA foreign_keys = OFF"); err != nil {
+		return err
+	}
+	defer db.Exec("PRAGMA foreign_keys = ON")
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	list := strings.Join(columns, ",")
+	for _, statement := range []string{
+		newSchema,
+		"INSERT INTO " + table + "_new(" + list + ",restaurant_id) SELECT " + list + ",1 FROM " + table,
+		"DROP TABLE " + table,
+		"ALTER TABLE " + table + "_new RENAME TO " + table,
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("%w (%s)", err, statement)
+		}
+	}
+	return tx.Commit()
+}
+
+func tableColumns(db *sql.DB, table string) ([]string, error) {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := make([]string, 0)
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, kind string
+		var value sql.NullString
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &value, &pk); err != nil {
+			return nil, err
+		}
+		columns = append(columns, name)
+	}
+	return columns, rows.Err()
+}
+
+// migrateOwnerRoles переводит аккаунты на роли сети: первый администратор — владелец,
+// остальные администраторы — директора ресторана 1, менеджеры и официанты — сотрудники
+// ресторана 1, поставщики — общие для всех ресторанов.
+func migrateOwnerRoles(db *sql.DB) error {
+	var schema string
+	if err := db.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'").Scan(&schema); err != nil {
+		return err
+	}
+	if strings.Contains(schema, "'owner'") {
+		return nil
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys = OFF"); err != nil {
+		return err
+	}
+	defer db.Exec("PRAGMA foreign_keys = ON")
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, statement := range []string{
+		"CREATE TABLE accounts_new (" +
+			"id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE, " +
+			"password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('owner','director','manager','waiter','supplier')), " +
+			"created_at TEXT NOT NULL, restaurant_id INTEGER NULL REFERENCES restaurants(id))",
+		"INSERT INTO accounts_new(id,name,email,password_hash,role,created_at,restaurant_id) " +
+			"SELECT id,name,email,password_hash," +
+			"CASE WHEN role='admin' AND id=(SELECT MIN(id) FROM accounts WHERE role='admin') THEN 'owner' " +
+			"WHEN role='admin' THEN 'director' ELSE role END," +
+			"created_at," +
+			"CASE WHEN role='supplier' OR (role='admin' AND id=(SELECT MIN(id) FROM accounts WHERE role='admin')) THEN NULL ELSE 1 END " +
+			"FROM accounts",
 		"DROP TABLE accounts",
 		"ALTER TABLE accounts_new RENAME TO accounts",
 	} {

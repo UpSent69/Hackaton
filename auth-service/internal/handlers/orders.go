@@ -100,7 +100,7 @@ func (a *API) buildDish(id int64, now time.Time) (contract.Dish, error) {
 
 func (a *API) Menu(w http.ResponseWriter, r *http.Request) {
 	now, _ := a.nowAndSpeed()
-	rows, err := a.DB.Query("SELECT id FROM dishes ORDER BY name COLLATE NOCASE,id")
+	rows, err := a.DB.Query("SELECT id FROM dishes WHERE restaurant_id=? ORDER BY name COLLATE NOCASE,id", restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить меню")
 		return
@@ -131,7 +131,7 @@ func (a *API) Menu(w http.ResponseWriter, r *http.Request) {
 		}
 		menu = append(menu, dish)
 	}
-	offers, err := a.computeHotOffers(now)
+	offers, err := a.computeHotOffers(restaurantOf(r), now)
 	if err == nil {
 		scores := make(map[string]int, len(offers))
 		for _, offer := range offers {
@@ -171,7 +171,7 @@ func (a *API) CreateDish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var exists int
-		if err := a.DB.QueryRow("SELECT COUNT(*) FROM products WHERE id=?", id).Scan(&exists); err != nil || exists == 0 {
+		if err := a.DB.QueryRow("SELECT COUNT(*) FROM products WHERE id=? AND restaurant_id=?", id, restaurantOf(r)).Scan(&exists); err != nil || exists == 0 {
 			a.writeError(w, http.StatusBadRequest, "Один из ингредиентов не найден на складе")
 			return
 		}
@@ -184,7 +184,7 @@ func (a *API) CreateDish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec("INSERT INTO dishes(name) VALUES(?)", req.Name)
+	result, err := tx.Exec("INSERT INTO dishes(name,restaurant_id) VALUES(?,?)", req.Name, restaurantOf(r))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "constraint") {
 			a.writeError(w, http.StatusConflict, "Блюдо с таким названием уже существует")
@@ -228,7 +228,7 @@ func (a *API) DeleteDish(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор блюда")
 		return
 	}
-	result, err := a.DB.Exec("DELETE FROM dishes WHERE id=?", id)
+	result, err := a.DB.Exec("DELETE FROM dishes WHERE id=? AND restaurant_id=?", id, restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить блюдо")
 		return
@@ -256,7 +256,8 @@ type orderLine struct {
 	Portions int64
 }
 
-func (a *API) orderRequirements(req contract.OrderRequest) ([]orderLine, map[int64]*productRequirement, error) {
+// orderRequirements считает потребность в продуктах; блюда берутся только из меню ресторана.
+func (a *API) orderRequirements(restaurantID int64, req contract.OrderRequest) ([]orderLine, map[int64]*productRequirement, error) {
 	if len(req.Items) == 0 || len(req.Items) > 100 {
 		return nil, nil, fmt.Errorf("Добавьте от 1 до 100 позиций в заказ")
 	}
@@ -268,7 +269,7 @@ func (a *API) orderRequirements(req contract.OrderRequest) ([]orderLine, map[int
 			return nil, nil, fmt.Errorf("Укажите корректное блюдо и положительное количество порций")
 		}
 		var name string
-		if err := a.DB.QueryRow("SELECT name FROM dishes WHERE id=?", dishID).Scan(&name); err != nil {
+		if err := a.DB.QueryRow("SELECT name FROM dishes WHERE id=? AND restaurant_id=?", dishID, restaurantID).Scan(&name); err != nil {
 			if err == sql.ErrNoRows {
 				return nil, nil, fmt.Errorf("Одно из блюд больше не существует")
 			}
@@ -364,7 +365,7 @@ func (a *API) ValidateOrder(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "Проверьте формат заказа")
 		return
 	}
-	_, required, err := a.orderRequirements(req)
+	_, required, err := a.orderRequirements(restaurantOf(r), req)
 	if err != nil {
 		a.writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -445,7 +446,7 @@ func (a *API) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "Проверьте формат заказа")
 		return
 	}
-	lines, required, err := a.orderRequirements(req)
+	lines, required, err := a.orderRequirements(restaurantOf(r), req)
 	if err != nil {
 		a.writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -464,7 +465,7 @@ func (a *API) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var nextNumber int64
-	if err := tx.QueryRow("SELECT COALESCE(MAX(order_number),0)+1 FROM orders").Scan(&nextNumber); err != nil {
+	if err := tx.QueryRow("SELECT COALESCE(MAX(order_number),0)+1 FROM orders WHERE restaurant_id=?", restaurantOf(r)).Scan(&nextNumber); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось назначить номер заказа")
 		return
 	}
@@ -473,8 +474,8 @@ func (a *API) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		status = contract.OrderRejected
 	}
 	result, err := tx.Exec(
-		"INSERT INTO orders(order_number,created_at,status,shortages_json) VALUES(?,?,?,?)",
-		nextNumber, formatTime(now), string(status), jsonString(shortages),
+		"INSERT INTO orders(order_number,created_at,status,shortages_json,restaurant_id) VALUES(?,?,?,?,?)",
+		nextNumber, formatTime(now), string(status), jsonString(shortages), restaurantOf(r),
 	)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить заказ")
@@ -652,7 +653,7 @@ func (a *API) loadOrder(id int64) (contract.Order, error) {
 }
 
 func (a *API) Orders(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.DB.Query("SELECT id FROM orders ORDER BY order_number DESC,id DESC")
+	rows, err := a.DB.Query("SELECT id FROM orders WHERE restaurant_id=? ORDER BY order_number DESC,id DESC", restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить историю заказов")
 		return

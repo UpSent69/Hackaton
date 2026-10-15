@@ -167,9 +167,19 @@ const UI = (() => {
     ['demo', 'Демо', 'app.html#/demo'],
   ]
 
+  // Владелец и директор — полные права в ресторане.
   const isAdmin = () => {
     const user = API.getUser()
-    return Boolean(user && user.role === 'admin')
+    return Boolean(user && (user.role === 'owner' || user.role === 'director'))
+  }
+
+  // Текущий ресторан в шапке: владелец может его сменить, сотрудники видят свой.
+  function restaurantChip(user) {
+    const restaurant = API.getRestaurant()
+    if (!user || !restaurant || user.role === 'supplier') return ''
+    return user.role === 'owner'
+      ? `<a class="btn btn-line btn-sm" href="app.html#/restaurants" title="Сменить ресторан">${escapeHtml(restaurant.name)} · сменить</a>`
+      : `<span class="label tag">${escapeHtml(restaurant.name)}</span>`
   }
 
   // Официанту в шапке видна только вкладка «Заказы», поставщику — только «Поставки».
@@ -179,7 +189,7 @@ const UI = (() => {
   // проверяет API: страница не перенаправляет пользователя при 401/403.
   function shell(active) {
     const user = API.getUser()
-    const admin = Boolean(user && user.role === 'admin')
+    const admin = isAdmin()
     const app = document.getElementById('app')
     // Менеджер видит все данные, но кнопки изменения у него скрыты (см. [data-admin] в styles.css).
     // Официант и поставщик меняют данные на своей странице, но удалять поставки не могут (is-staff).
@@ -187,7 +197,8 @@ const UI = (() => {
     app.classList.toggle('is-viewer', Boolean(user) && !admin && !only)
     app.classList.toggle('is-staff', Boolean(only))
 
-    const links = NAV.filter(([key]) => !only || only.includes(key)).map(([key, label, href]) => `<a href="${href}"${key === active ? ' class="active"' : ''}>${label}</a>`).join('')
+    const links = NAV.filter(([key]) => !only || only.includes(key)).map(([key, label, href]) => `<a href="${href}"${key === active ? ' class="active"' : ''}>${label}</a>`).join('') +
+      (user ? '' : '<a href="app.html#/register">Зарегистрироваться</a>')
     const old = app.querySelector('.nav')
     if (old) {
       old.nextElementSibling.remove()
@@ -196,10 +207,11 @@ const UI = (() => {
     app.insertAdjacentHTML(
       'afterbegin',
       `<header class="nav">
-        <a class="logo" href="${API.roleHome() || 'index.html'}">Stoplist</a>
+        <a class="logo" href="${API.roleHome() || 'index.html'}">Checklist</a>
         <nav class="nav-links" aria-label="Основная навигация">${links}</nav>
         <div class="nav-actions">
           <span class="nav-user" title="${escapeHtml(user?.email || '')}">${escapeHtml(user?.name || 'Сессия определяется сервером')}</span>
+          ${restaurantChip(user)}
           ${admin ? '<a class="btn btn-line btn-sm" href="app.html#/admin">Администрирование</a>' : ''}
           <span class="label tag clock-chip" id="clockChip" hidden></span>
           ${user ? '<button type="button" class="btn btn-line btn-sm" data-logout>Выйти</button>' : '<a class="btn btn-line btn-sm" href="login.html">Войти</a>'}
@@ -208,6 +220,7 @@ const UI = (() => {
       </header>
       <nav class="menu" id="menu" aria-label="Мобильная навигация">
         ${links}<div class="divider"></div>
+        ${user && user.role === 'owner' ? '<a href="app.html#/restaurants">Сменить ресторан</a>' : ''}
         ${admin ? '<a href="app.html#/admin">Администрирование</a>' : ''}
         ${user ? '<a href="index.html" data-logout>Завершить сессию</a>' : '<a href="login.html">Войти</a>'}
       </nav>`,

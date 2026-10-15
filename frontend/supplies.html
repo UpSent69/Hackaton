@@ -3,12 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Поставки — Stoplist</title>
+    <title>Поставки — Checklist</title>
     <link rel="icon" type="image/svg+xml" href="favicon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=20261015-7" />
+    <link rel="stylesheet" href="styles.css?v=20261015-14" />
     <style>
       /* Сцена страницы: конвейер, по которому едут ящики с поставкой */
       .belt { position: absolute; left: -8%; right: -8%; bottom: 34px; height: 2px; background: rgba(255, 255, 255, 0.28); }
@@ -48,7 +48,7 @@
       @keyframes rowOut { to { opacity: 0; transform: translateX(14px); } }
       tr.is-sub .item-list li { animation: rise 0.4s cubic-bezier(0.16, 1, 0.3, 1) both; animation-delay: calc(var(--i, 0) * 40ms); }
     </style>
-    <script src="motion.js?v=20261015-7"></script>
+    <script src="motion.js?v=20261015-14"></script>
   </head>
   <body>
     <div class="app" id="app">
@@ -86,6 +86,10 @@
               <input type="file" id="importFile" accept=".xlsx,.csv,.tsv,.txt,.md,.log,.json,.xml,.docx,.pdf,.png,.jpg,.jpeg" hidden />
             </div>
           </div>
+          <label class="field" style="max-width: 280px" id="restaurantField" hidden>
+            <span class="label">Ресторан</span>
+            <select class="input" id="supplyRestaurant"></select>
+          </label>
           <label class="field" style="max-width: 280px">
             <span class="label">Номер поставки</span>
             <input class="input" id="supplyNumber" placeholder="П-0001" autocomplete="off" />
@@ -122,8 +126,8 @@
       </main>
     </div>
 
-    <script src="api.js?v=20261015-7"></script>
-        <script src="shared.js?v=20261015-7"></script>
+    <script src="api.js?v=20261015-14"></script>
+        <script src="shared.js?v=20261015-14"></script>
     <script>
       ;(() => {
         if (!UI.shell('supplies')) return
@@ -145,8 +149,29 @@
         // Поставщик отправляет поставку на проверку; рассматривают её менеджер и администратор.
         const role = (API.getUser() || {}).role
         const isSupplier = role === 'supplier'
-        const canReview = role === 'admin' || role === 'manager'
+        const canReview = role === 'owner' || role === 'director' || role === 'manager'
         if (isSupplier) form.querySelector('[type=submit]').textContent = 'Отправить на проверку'
+
+        // Поставщик общий для всех ресторанов: в форме он выбирает, в какой ресторан поставка.
+        // Выбранный ресторан уходит заголовком — по его складу сверяются названия при импорте файла.
+        const restaurantSelect = document.getElementById('supplyRestaurant')
+        if (isSupplier) {
+          document.getElementById('restaurantField').hidden = false
+          API.get('/restaurants')
+            .then((list) => {
+              const current = API.getRestaurant()
+              restaurantSelect.innerHTML = '<option value="">Выберите ресторан</option>' +
+                list.map((item) => `<option value="${escapeHtml(item.id)}"${current && current.id === item.id ? ' selected' : ''}>${escapeHtml(item.name)}</option>`).join('')
+            })
+            .catch(() => {})
+          restaurantSelect.addEventListener('change', () => {
+            restaurantSelect.classList.remove('is-invalid')
+            const option = restaurantSelect.selectedOptions[0]
+            API.setRestaurant(restaurantSelect.value ? { id: restaurantSelect.value, name: option.textContent } : null)
+            loadProducts()
+          })
+        }
+        const needRestaurant = () => isSupplier && !restaurantSelect.value
 
         const SUPPLY_STATUS = {
           pending: ['На проверке', '#f2c24b'],
@@ -259,7 +284,14 @@
           URL.revokeObjectURL(url)
         })
 
-        document.getElementById('importBtn').addEventListener('click', () => fileInput.click())
+        document.getElementById('importBtn').addEventListener('click', () => {
+          if (needRestaurant()) {
+            restaurantSelect.classList.add('is-invalid')
+            UI.setMessage(formMsg, 'Сначала выберите ресторан, в который идёт поставка', true)
+            return
+          }
+          fileInput.click()
+        })
 
         fileInput.addEventListener('change', async () => {
           const file = fileInput.files[0]
@@ -303,6 +335,7 @@
             if (bad) valid = false
           }
           mark(numberInput, !numberInput.value.trim())
+          if (isSupplier) mark(restaurantSelect, !restaurantSelect.value)
           const items = [...rows.querySelectorAll('.supply-row')].map((row) => {
             const data = rowData(row)
             mark(row.querySelector('[name=name]'), !data.name)
@@ -311,17 +344,22 @@
             return { name: data.name, unit: data.unit, quantity: Number(data.quantity), shelfLifeHours: Number(data.shelfLifeHours), lotNumber: data.lotNumber }
           })
           if (!valid) {
-            UI.setMessage(formMsg, 'Заполните номер поставки, продукт, количество и срок хранения в каждой строке', true)
+            UI.setMessage(formMsg, isSupplier && !restaurantSelect.value
+              ? 'Выберите ресторан, в который идёт поставка'
+              : 'Заполните номер поставки, продукт, количество и срок хранения в каждой строке', true)
             return
           }
 
           const submit = form.querySelector('[type=submit]')
           submit.disabled = true
           try {
-            const supply = await UI.call(API.post('/supplies', { number: numberInput.value.trim(), items, importId: importId || undefined }))
+            const supply = await UI.call(API.post('/supplies', {
+              number: numberInput.value.trim(), items, importId: importId || undefined,
+              restaurantId: isSupplier ? restaurantSelect.value : undefined,
+            }))
             importId = null
             UI.setMessage(formMsg, supply.status === 'pending'
-              ? `Поставка ${supply.number} отправлена на проверку менеджеру`
+              ? `Поставка ${supply.number} отправлена на проверку в ${supply.restaurantName}`
               : `Поставка ${supply.number} принята, партий создано: ${supply.items.length}`)
             numberInput.value = ''
             rows.innerHTML = rowHtml(null, true)
@@ -370,7 +408,7 @@
                   return `<tr class="is-click rise" ${UI.order(index)} data-supply="${escapeHtml(supply.id)}" data-number="${escapeHtml(supply.number)}">
                     <td class="col-chev">${UI.chevron(open)}</td>
                     <td class="strong nowrap">${escapeHtml(supply.number)}</td>
-                    <td class="dim nowrap">${formatDateTime(supply.createdAt)}${supply.createdBy ? `<div class="cell-note">${escapeHtml(supply.createdBy)}</div>` : ''}</td>
+                    <td class="dim nowrap">${formatDateTime(supply.createdAt)}${isSupplier ? `<div class="cell-note">${escapeHtml(supply.restaurantName || '')}</div>` : supply.createdBy ? `<div class="cell-note">${escapeHtml(supply.createdBy)}</div>` : ''}</td>
                     <td class="nowrap">${supplyBadge(supply.status)}</td>
                     <td class="num">${supplyLines(supply).length}</td>
                     <td class="dim">${supplyLines(supply).map((item) => escapeHtml(item.name)).join(' · ')}</td>

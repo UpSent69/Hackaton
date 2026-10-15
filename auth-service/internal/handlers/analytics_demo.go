@@ -13,7 +13,7 @@ import (
 )
 
 func (a *API) Alerts(w http.ResponseWriter, r *http.Request) {
-	alerts, err := a.latestAlerts(60)
+	alerts, err := a.latestAlerts(restaurantOf(r), 60)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить уведомления")
 		return
@@ -21,20 +21,21 @@ func (a *API) Alerts(w http.ResponseWriter, r *http.Request) {
 	a.sendJSON(w, http.StatusOK, alerts)
 }
 
-func (a *API) latestAlerts(limit int) ([]contract.Alert, error) {
+// latestAlerts — последние уведомления ресторана (0 — ресторан не выбран, уведомлений нет).
+func (a *API) latestAlerts(restaurantID int64, limit int) ([]contract.Alert, error) {
 	if limit < 1 {
 		limit = 5
 	}
 	// Ленту уведомлений спрашивает опрос каждой страницы раз в 3 секунды — она кэшируется
 	// в Redis до следующего изменения данных (новое уведомление всегда меняет ревизию).
-	cacheKey := "alerts:" + strconv.Itoa(limit) + ":" + strconv.FormatInt(a.currentRev(), 10)
+	cacheKey := "alerts:" + strconv.FormatInt(restaurantID, 10) + ":" + strconv.Itoa(limit) + ":" + strconv.FormatInt(a.currentRev(), 10)
 	if cached, ok := a.KV.Get(cacheKey); ok {
 		var alerts []contract.Alert
 		if json.Unmarshal([]byte(cached), &alerts) == nil {
 			return alerts, nil
 		}
 	}
-	alerts, err := a.queryAlerts(limit)
+	alerts, err := a.queryAlerts(restaurantID, limit)
 	if err == nil {
 		if encoded, encodeErr := json.Marshal(alerts); encodeErr == nil {
 			a.KV.Set(cacheKey, string(encoded), 30*time.Second)
@@ -43,8 +44,8 @@ func (a *API) latestAlerts(limit int) ([]contract.Alert, error) {
 	return alerts, err
 }
 
-func (a *API) queryAlerts(limit int) ([]contract.Alert, error) {
-	rows, err := a.DB.Query("SELECT id,at,level,text FROM alerts ORDER BY id DESC LIMIT ?", limit)
+func (a *API) queryAlerts(restaurantID int64, limit int) ([]contract.Alert, error) {
+	rows, err := a.DB.Query("SELECT id,at,level,text FROM alerts WHERE restaurant_id=? ORDER BY id DESC LIMIT ?", restaurantID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +74,7 @@ func (a *API) queryAlerts(limit int) ([]contract.Alert, error) {
 
 func (a *API) Pulse(w http.ResponseWriter, r *http.Request) {
 	now, speed := a.nowAndSpeed()
-	alerts, err := a.latestAlerts(5)
+	alerts, err := a.latestAlerts(restaurantOf(r), 5)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить состояние")
 		return
@@ -154,7 +155,8 @@ func (a *API) DemoSeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	if err := clearOperationalData(tx); err != nil {
+	restaurantID := restaurantOf(r)
+	if err := clearOperationalData(tx, restaurantID); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось очистить старые демо-данные")
 		return
 	}
@@ -171,7 +173,7 @@ func (a *API) DemoSeed(w http.ResponseWriter, r *http.Request) {
 	}
 	productIDs := make(map[string]int64)
 	supplyNumber := "DEMO-" + strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
-	result, err := tx.Exec("INSERT INTO supplies(number,created_at) VALUES(?,?)", supplyNumber, formatTime(now))
+	result, err := tx.Exec("INSERT INTO supplies(number,created_at,restaurant_id) VALUES(?,?,?)", supplyNumber, formatTime(now), restaurantID)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось создать демонстрационную поставку")
 		return
@@ -183,7 +185,7 @@ func (a *API) DemoSeed(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, product := range products {
 		norm := normalizeName(product.Name)
-		result, err := tx.Exec("INSERT INTO products(name,norm_name,unit) VALUES(?,?,?)", product.Name, norm, string(product.Unit))
+		result, err := tx.Exec("INSERT INTO products(name,norm_name,unit,restaurant_id) VALUES(?,?,?,?)", product.Name, norm, string(product.Unit), restaurantID)
 		if err != nil {
 			a.writeError(w, http.StatusInternalServerError, "Не удалось создать демонстрационные продукты")
 			return
@@ -213,7 +215,7 @@ func (a *API) DemoSeed(w http.ResponseWriter, r *http.Request) {
 		{Name: "Суп со сливками", Ingredients: []seedIngredient{{"Сливки", 150}, {"Сыр", 35}, {"Рис", 40}}},
 	}
 	for _, dish := range dishes {
-		result, err := tx.Exec("INSERT INTO dishes(name) VALUES(?)", dish.Name)
+		result, err := tx.Exec("INSERT INTO dishes(name,restaurant_id) VALUES(?,?)", dish.Name, restaurantID)
 		if err != nil {
 			a.writeError(w, http.StatusInternalServerError, "Не удалось создать демонстрационное меню")
 			return
@@ -247,20 +249,22 @@ func (a *API) DemoSeed(w http.ResponseWriter, r *http.Request) {
 	a.sendJSON(w, http.StatusOK, contract.DemoState{Now: now, Speed: func() float64 { _, speed := a.nowAndSpeed(); return speed }(), Shifted: a.shifted()})
 }
 
-func clearOperationalData(tx *sql.Tx) error {
+// clearOperationalData удаляет данные одного ресторана (демо: «заполнить примером» и «сбросить»).
+func clearOperationalData(tx *sql.Tx, restaurantID int64) error {
 	for _, statement := range []string{
-		"DELETE FROM order_writeoffs",
-		"DELETE FROM order_items",
-		"DELETE FROM orders",
-		"DELETE FROM dish_ingredients",
-		"DELETE FROM dishes",
-		"DELETE FROM batches",
-		"DELETE FROM supply_pending_items",
-		"DELETE FROM supplies",
-		"DELETE FROM products",
-		"DELETE FROM alerts",
+		"DELETE FROM order_writeoffs WHERE order_id IN (SELECT id FROM orders WHERE restaurant_id=?)",
+		"DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE restaurant_id=?)",
+		"DELETE FROM orders WHERE restaurant_id=?",
+		"DELETE FROM dish_ingredients WHERE dish_id IN (SELECT id FROM dishes WHERE restaurant_id=?)",
+		"DELETE FROM dishes WHERE restaurant_id=?",
+		"DELETE FROM batches WHERE supply_id IN (SELECT id FROM supplies WHERE restaurant_id=?)",
+		"DELETE FROM supply_pending_items WHERE supply_id IN (SELECT id FROM supplies WHERE restaurant_id=?)",
+		"UPDATE supply_imports SET supply_id=NULL WHERE supply_id IN (SELECT id FROM supplies WHERE restaurant_id=?)",
+		"DELETE FROM supplies WHERE restaurant_id=?",
+		"DELETE FROM products WHERE restaurant_id=? AND id NOT IN (SELECT product_id FROM batches)",
+		"DELETE FROM alerts WHERE restaurant_id=?",
 	} {
-		if _, err := tx.Exec(statement); err != nil {
+		if _, err := tx.Exec(statement, restaurantID); err != nil {
 			return err
 		}
 	}
@@ -269,7 +273,8 @@ func clearOperationalData(tx *sql.Tx) error {
 
 func (a *API) DemoRestock(w http.ResponseWriter, r *http.Request) {
 	now, _ := a.nowAndSpeed()
-	rows, err := a.DB.Query("SELECT DISTINCT p.id,p.name,p.unit FROM products p JOIN batches b ON b.product_id=p.id")
+	restaurantID := restaurantOf(r)
+	rows, err := a.DB.Query("SELECT DISTINCT p.id,p.name,p.unit FROM products p JOIN batches b ON b.product_id=p.id WHERE p.restaurant_id=?", restaurantID)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось определить продукты для пополнения")
 		return
@@ -324,7 +329,7 @@ func (a *API) DemoRestock(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 	number := "AUTO-" + strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
-	result, err := tx.Exec("INSERT INTO supplies(number,created_at) VALUES(?,?)", number, formatTime(now))
+	result, err := tx.Exec("INSERT INTO supplies(number,created_at,restaurant_id) VALUES(?,?,?)", number, formatTime(now), restaurantID)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось создать поставку пополнения")
 		return
@@ -371,7 +376,7 @@ func (a *API) DemoReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	if err := clearOperationalData(tx); err != nil {
+	if err := clearOperationalData(tx, restaurantOf(r)); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось сбросить данные")
 		return
 	}
@@ -388,8 +393,8 @@ func (a *API) DemoReset(w http.ResponseWriter, r *http.Request) {
 	a.sendJSON(w, http.StatusOK, contract.DemoState{Now: now, Speed: speed, Shifted: false})
 }
 
-func (a *API) computeHotOffers(now time.Time) ([]contract.HotOffer, error) {
-	batches, err := a.loadBatchRows("WHERE b.qty_remaining>0 ORDER BY b.expires_at ASC,b.id ASC")
+func (a *API) computeHotOffers(restaurantID int64, now time.Time) ([]contract.HotOffer, error) {
+	batches, err := a.loadBatchRows("WHERE p.restaurant_id=? AND b.qty_remaining>0 ORDER BY b.expires_at ASC,b.id ASC", restaurantID)
 	if err != nil {
 		return nil, err
 	}
@@ -571,7 +576,7 @@ func (a *API) computeHotOffers(now time.Time) ([]contract.HotOffer, error) {
 
 func (a *API) HotOffers(w http.ResponseWriter, r *http.Request) {
 	now, _ := a.nowAndSpeed()
-	offers, err := a.computeHotOffers(now)
+	offers, err := a.computeHotOffers(restaurantOf(r), now)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать горячие предложения")
 		return
@@ -637,22 +642,24 @@ func (a *API) Analytics(w http.ResponseWriter, r *http.Request) {
 		Forecast: make([]contract.Forecast, 0),
 		Purchases: make([]contract.Purchase, 0),
 	}
-	if err := a.DB.QueryRow("SELECT COUNT(*) FROM orders WHERE status='accepted'").Scan(&result.Orders.Accepted); err != nil {
+	restaurantID := restaurantOf(r)
+	if err := a.DB.QueryRow("SELECT COUNT(*) FROM orders WHERE status='accepted' AND restaurant_id=?", restaurantID).Scan(&result.Orders.Accepted); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать аналитику")
 		return
 	}
-	if err := a.DB.QueryRow("SELECT COUNT(*) FROM orders WHERE status='rejected'").Scan(&result.Orders.Rejected); err != nil {
+	if err := a.DB.QueryRow("SELECT COUNT(*) FROM orders WHERE status='rejected' AND restaurant_id=?", restaurantID).Scan(&result.Orders.Rejected); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать аналитику")
 		return
 	}
-	if err := a.DB.QueryRow("SELECT COUNT(*) FROM batches WHERE written_off>0").Scan(&result.WriteoffEvents); err != nil {
+	if err := a.DB.QueryRow("SELECT COUNT(*) FROM batches b JOIN products p ON p.id=b.product_id WHERE b.written_off>0 AND p.restaurant_id=?", restaurantID).Scan(&result.WriteoffEvents); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать списания")
 		return
 	}
 
 	rows, err := a.DB.Query(
 		"SELECT p.id,p.name,p.unit,COALESCE(SUM(b.written_off),0),COALESCE(SUM(b.qty_initial),0) "+
-			"FROM products p JOIN batches b ON b.product_id=p.id GROUP BY p.id,p.name,p.unit",
+			"FROM products p JOIN batches b ON b.product_id=p.id WHERE p.restaurant_id=? GROUP BY p.id,p.name,p.unit",
+		restaurantID,
 	)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать списания")
@@ -682,7 +689,7 @@ func (a *API) Analytics(w http.ResponseWriter, r *http.Request) {
 	rows.Close()
 	sort.Slice(result.Writeoffs, func(i, j int) bool { return result.Writeoffs[i].Share > result.Writeoffs[j].Share })
 
-	rows, err = a.DB.Query("SELECT shortages_json FROM orders WHERE status='rejected'")
+	rows, err = a.DB.Query("SELECT shortages_json FROM orders WHERE status='rejected' AND restaurant_id=?", restaurantID)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать дефициты")
 		return
@@ -733,7 +740,7 @@ func (a *API) Analytics(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать расход продуктов")
 		return
 	}
-	productRows, err := a.DB.Query("SELECT id,name,unit FROM products ORDER BY name COLLATE NOCASE")
+	productRows, err := a.DB.Query("SELECT id,name,unit FROM products WHERE restaurant_id=? ORDER BY name COLLATE NOCASE", restaurantID)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать закупки")
 		return
@@ -762,7 +769,7 @@ func (a *API) Analytics(w http.ResponseWriter, r *http.Request) {
 
 	maxTenPortions := make(map[int64]int64)
 	minFivePortions := make(map[int64]int64)
-	dishRows, err := a.DB.Query("SELECT dish_id,product_id,quantity FROM dish_ingredients")
+	dishRows, err := a.DB.Query("SELECT di.dish_id,di.product_id,di.quantity FROM dish_ingredients di JOIN dishes d ON d.id=di.dish_id WHERE d.restaurant_id=?", restaurantID)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось прочитать рецепты")
 		return
@@ -834,7 +841,7 @@ func (a *API) Analytics(w http.ResponseWriter, r *http.Request) {
 
 	// Build a practical forecast for recipes with either sales history or a batch that
 	// is due to expire before the next portion can be prepared.
-	menuRows, err := a.DB.Query("SELECT id FROM dishes ORDER BY name COLLATE NOCASE")
+	menuRows, err := a.DB.Query("SELECT id FROM dishes WHERE restaurant_id=? ORDER BY name COLLATE NOCASE", restaurantID)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось рассчитать прогноз стоп-листа")
 		return

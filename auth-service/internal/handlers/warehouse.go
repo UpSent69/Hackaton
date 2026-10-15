@@ -28,6 +28,7 @@ type batchRow struct {
 	ReceivedAt   time.Time
 	ExpiresAt    time.Time
 	LastStatus   string
+	RestaurantID int64
 }
 
 func batchStatus(receivedAt, expiresAt, now time.Time) contract.ExpiryStatus {
@@ -64,7 +65,7 @@ func statusRank(status contract.ExpiryStatus) int {
 
 func (a *API) loadBatchRows(where string, args ...interface{}) ([]batchRow, error) {
 	query := "SELECT b.id,b.product_id,b.supply_id,s.number,p.name,p.unit," +
-		"b.qty_initial,b.qty_remaining,b.written_off,b.received_at,b.expires_at,b.last_status " +
+		"b.qty_initial,b.qty_remaining,b.written_off,b.received_at,b.expires_at,b.last_status,p.restaurant_id " +
 		"FROM batches b JOIN products p ON p.id=b.product_id JOIN supplies s ON s.id=b.supply_id " + where
 	rows, err := a.DB.Query(query, args...)
 	if err != nil {
@@ -76,7 +77,7 @@ func (a *API) loadBatchRows(where string, args ...interface{}) ([]batchRow, erro
 		var received, expires string
 		if err := rows.Scan(
 			&item.ID, &item.ProductID, &item.SupplyID, &item.SupplyNumber, &item.ProductName, &item.Unit,
-			&item.QtyInitial, &item.QtyRemaining, &item.WrittenOff, &received, &expires, &item.LastStatus,
+			&item.QtyInitial, &item.QtyRemaining, &item.WrittenOff, &received, &expires, &item.LastStatus, &item.RestaurantID,
 		); err != nil {
 			rows.Close()
 			return nil, err
@@ -95,15 +96,16 @@ func (a *API) loadBatchRows(where string, args ...interface{}) ([]batchRow, erro
 
 // warehouseEvent — событие склада (core → notification-service): из него строится уведомление.
 type warehouseEvent struct {
-	Level string    `json:"level"`
-	Text  string    `json:"text"`
-	At    time.Time `json:"at"`
+	RestaurantID int64     `json:"restaurantId"`
+	Level        string    `json:"level"`
+	Text         string    `json:"text"`
+	At           time.Time `json:"at"`
 }
 
 // addAlert публикует событие склада в Kafka; уведомление записывает notification-service.
 // Без Kafka (локальный запуск без KAFKA_BROKERS) уведомление пишется сразу.
-func (a *API) addAlert(level contract.AlertLevel, text string, at time.Time) {
-	event := warehouseEvent{Level: string(level), Text: text, At: at}
+func (a *API) addAlert(restaurantID int64, level contract.AlertLevel, text string, at time.Time) {
+	event := warehouseEvent{RestaurantID: restaurantID, Level: string(level), Text: text, At: at}
 	if a.Bus.Enabled() {
 		a.Bus.PublishAsync(events.TopicWarehouseEvents, string(level), event)
 		return
@@ -112,7 +114,7 @@ func (a *API) addAlert(level contract.AlertLevel, text string, at time.Time) {
 }
 
 func (a *API) insertAlert(event warehouseEvent) {
-	_, _ = a.DB.Exec("INSERT INTO alerts(at,level,text) VALUES(?,?,?)", formatTime(event.At), event.Level, event.Text)
+	_, _ = a.DB.Exec("INSERT INTO alerts(restaurant_id,at,level,text) VALUES(?,?,?,?)", event.RestaurantID, formatTime(event.At), event.Level, event.Text)
 }
 
 // storeWarehouseEvent (notification-service) записывает уведомление из warehouse.events
@@ -146,12 +148,12 @@ func (a *API) maintain() error {
 			if batch.LastStatus != "" {
 				switch status {
 				case contract.StatusWarning:
-					a.addAlert(contract.AlertLevel("warning"), fmt.Sprintf("У продукта «%s» из поставки %s скоро истекает срок.", batch.ProductName, batch.SupplyNumber), now)
+					a.addAlert(batch.RestaurantID, contract.AlertLevel("warning"), fmt.Sprintf("У продукта «%s» из поставки %s скоро истекает срок.", batch.ProductName, batch.SupplyNumber), now)
 				case contract.StatusCritical:
-					a.addAlert(contract.AlertLevel("critical"), fmt.Sprintf("У продукта «%s» из поставки %s критически близкий срок годности.", batch.ProductName, batch.SupplyNumber), now)
+					a.addAlert(batch.RestaurantID, contract.AlertLevel("critical"), fmt.Sprintf("У продукта «%s» из поставки %s критически близкий срок годности.", batch.ProductName, batch.SupplyNumber), now)
 				case contract.StatusExpired:
 					if batch.QtyRemaining > 0 {
-						a.addAlert(contract.AlertLevel("expired"), fmt.Sprintf("Срок продукта «%s» из поставки %s истёк: спишите остаток на складе.", batch.ProductName, batch.SupplyNumber), now)
+						a.addAlert(batch.RestaurantID, contract.AlertLevel("expired"), fmt.Sprintf("Срок продукта «%s» из поставки %s истёк: спишите остаток на складе.", batch.ProductName, batch.SupplyNumber), now)
 					}
 				}
 			}
@@ -165,7 +167,7 @@ func (a *API) maintain() error {
 }
 
 func (a *API) refreshStopStatuses(now time.Time) error {
-	rows, err := a.DB.Query("SELECT id,name,stopped_since FROM dishes ORDER BY id")
+	rows, err := a.DB.Query("SELECT id,name,stopped_since,restaurant_id FROM dishes ORDER BY id")
 	if err != nil {
 		return err
 	}
@@ -173,11 +175,12 @@ func (a *API) refreshStopStatuses(now time.Time) error {
 		ID int64
 		Name string
 		StoppedSince sql.NullString
+		RestaurantID int64
 	}
 	dishes := make([]dishState, 0)
 	for rows.Next() {
 		var d dishState
-		if err := rows.Scan(&d.ID, &d.Name, &d.StoppedSince); err != nil {
+		if err := rows.Scan(&d.ID, &d.Name, &d.StoppedSince, &d.RestaurantID); err != nil {
 			rows.Close()
 			return err
 		}
@@ -201,14 +204,14 @@ func (a *API) refreshStopStatuses(now time.Time) error {
 			if err != nil {
 				return err
 			}
-			a.addAlert(contract.AlertLevel("stop"), fmt.Sprintf("Блюдо «%s» попало в стоп-лист: не хватает ингредиента.", old.Name), now)
+			a.addAlert(old.RestaurantID, contract.AlertLevel("stop"), fmt.Sprintf("Блюдо «%s» попало в стоп-лист: не хватает ингредиента.", old.Name), now)
 			changed = true
 		} else if !dish.Stopped && wasStopped {
 			_, err := a.DB.Exec("UPDATE dishes SET stopped_since=NULL WHERE id=?", old.ID)
 			if err != nil {
 				return err
 			}
-			a.addAlert(contract.AlertLevel("ok"), fmt.Sprintf("Блюдо «%s» снова доступно.", old.Name), now)
+			a.addAlert(old.RestaurantID, contract.AlertLevel("ok"), fmt.Sprintf("Блюдо «%s» снова доступно.", old.Name), now)
 			changed = true
 		}
 	}
@@ -233,7 +236,7 @@ func (a *API) availableProduct(productID int64, now time.Time) (int64, error) {
 }
 
 func (a *API) Products(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.DB.Query("SELECT id,name,unit,base_price_kopecks FROM products ORDER BY name COLLATE NOCASE")
+	rows, err := a.DB.Query("SELECT id,name,unit,base_price_kopecks FROM products WHERE restaurant_id=? ORDER BY name COLLATE NOCASE", restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить продукты")
 		return
@@ -281,7 +284,8 @@ func (a *API) Products(w http.ResponseWriter, r *http.Request) {
 func (a *API) Stock(w http.ResponseWriter, r *http.Request) {
 	now, _ := a.nowAndSpeed()
 	rows, err := a.DB.Query(
-		"SELECT DISTINCT p.id,p.name,p.unit FROM products p JOIN batches b ON b.product_id=p.id ORDER BY p.name COLLATE NOCASE",
+		"SELECT DISTINCT p.id,p.name,p.unit FROM products p JOIN batches b ON b.product_id=p.id WHERE p.restaurant_id=? ORDER BY p.name COLLATE NOCASE",
+		restaurantOf(r),
 	)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить склад")
@@ -351,7 +355,7 @@ func (a *API) Batches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var exists int
-	if err := a.DB.QueryRow("SELECT COUNT(*) FROM products WHERE id=?", productID).Scan(&exists); err != nil {
+	if err := a.DB.QueryRow("SELECT COUNT(*) FROM products WHERE id=? AND restaurant_id=?", productID, restaurantOf(r)).Scan(&exists); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось найти продукт")
 		return
 	}
@@ -384,7 +388,7 @@ func (a *API) Batches(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) Expiry(w http.ResponseWriter, r *http.Request) {
 	now, _ := a.nowAndSpeed()
-	batches, err := a.loadBatchRows("WHERE b.qty_remaining>0 OR b.written_off>0 ORDER BY b.expires_at ASC,b.id ASC")
+	batches, err := a.loadBatchRows("WHERE p.restaurant_id=? AND (b.qty_remaining>0 OR b.written_off>0) ORDER BY b.expires_at ASC,b.id ASC", restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить сроки годности")
 		return
@@ -412,10 +416,13 @@ func (a *API) Expiry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) Supplies(w http.ResponseWriter, r *http.Request) {
-	// Поставщик видит только свои поставки, остальные роли — все.
-	query, args := "SELECT id,number,created_at FROM supplies ORDER BY created_at DESC,id DESC", []any{}
+	// Поставщик видит свои поставки во все рестораны, остальные роли — поставки своего ресторана.
+	query, args := "SELECT id,number,created_at FROM supplies WHERE restaurant_id=? ORDER BY created_at DESC,id DESC", []any{restaurantOf(r)}
 	if auth := currentAuth(r); auth != nil && auth.User.Role == contract.RoleSupplier {
 		query, args = "SELECT id,number,created_at FROM supplies WHERE created_by=? ORDER BY created_at DESC,id DESC", []any{auth.User.ID}
+	} else if restaurantOf(r) == 0 {
+		a.writeError(w, http.StatusBadRequest, "Выберите ресторан")
+		return
 	}
 	rows, err := a.DB.Query(query, args...)
 	if err != nil {
@@ -462,13 +469,15 @@ func (a *API) loadSupply(id int64) (contract.Supply, error) {
 	var supply contract.Supply
 	var created, status string
 	var reviewed sql.NullString
+	var restaurantID int64
 	if err := a.DB.QueryRow(
-		"SELECT s.id,s.number,s.created_at,s.status,s.review_comment,s.reviewed_at,COALESCE(a.name,'') "+
-			"FROM supplies s LEFT JOIN accounts a ON a.id=s.created_by WHERE s.id=?", id).
-		Scan(&id, &supply.Number, &created, &status, &supply.Comment, &reviewed, &supply.CreatedBy); err != nil {
+		"SELECT s.id,s.number,s.created_at,s.status,s.review_comment,s.reviewed_at,COALESCE(a.name,''),s.restaurant_id,COALESCE(r.name,'') "+
+			"FROM supplies s LEFT JOIN accounts a ON a.id=s.created_by LEFT JOIN restaurants r ON r.id=s.restaurant_id WHERE s.id=?", id).
+		Scan(&id, &supply.Number, &created, &status, &supply.Comment, &reviewed, &supply.CreatedBy, &restaurantID, &supply.RestaurantName); err != nil {
 		return supply, err
 	}
 	supply.ID = strconv.FormatInt(id, 10)
+	supply.RestaurantID = strconv.FormatInt(restaurantID, 10)
 	supply.CreatedAt = parseTime(created)
 	supply.Status = contract.SupplyStatus(status)
 	if reviewed.Valid {
@@ -564,8 +573,21 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 	if auth != nil {
 		authorID = auth.User.ID
 	}
-	// Поставка поставщика не попадает на склад сразу: она ждёт проверки менеджера или администратора.
+	// Поставка поставщика не попадает на склад сразу: она ждёт проверки менеджера или директора
+	// того ресторана, который поставщик выбрал. Остальные создают поставку в своём ресторане.
 	pending := auth != nil && auth.User.Role == contract.RoleSupplier
+	restaurantID := restaurantOf(r)
+	if pending {
+		restaurantID, _ = strconv.ParseInt(strings.TrimSpace(req.RestaurantID), 10, 64)
+		var exists int
+		if a.DB.QueryRow("SELECT COUNT(*) FROM restaurants WHERE id=?", restaurantID).Scan(&exists); exists == 0 {
+			restaurantID = 0
+		}
+	}
+	if restaurantID == 0 {
+		a.writeError(w, http.StatusBadRequest, "Выберите ресторан, в который идёт поставка")
+		return
+	}
 	status := contract.SupplyAccepted
 	if pending {
 		status = contract.SupplyPending
@@ -577,11 +599,11 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	result, err := tx.Exec("INSERT INTO supplies(number,created_at,status,created_by) VALUES(?,?,?,?)",
-		req.Number, formatTime(now), string(status), authorID)
+	result, err := tx.Exec("INSERT INTO supplies(number,created_at,status,created_by,restaurant_id) VALUES(?,?,?,?,?)",
+		req.Number, formatTime(now), string(status), authorID, restaurantID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "constraint") {
-			a.writeError(w, http.StatusConflict, "Поставка с таким номером уже существует")
+			a.writeError(w, http.StatusConflict, "Поставка с таким номером в этом ресторане уже существует")
 			return
 		}
 		a.writeError(w, http.StatusInternalServerError, "Не удалось создать поставку")
@@ -596,9 +618,9 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 	for _, item := range req.Items {
 		var err error
 		if pending {
-			err = queueSupplyItem(tx, supplyID, item)
+			err = queueSupplyItem(tx, restaurantID, supplyID, item)
 		} else {
-			err = insertSupplyBatch(tx, supplyID, item, now)
+			err = insertSupplyBatch(tx, restaurantID, supplyID, item, now)
 		}
 		if err != nil {
 			a.writeSupplyItemError(w, err)
@@ -621,7 +643,7 @@ func (a *API) CreateSupply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if pending {
-		a.addAlert(contract.AlertLevel("warning"), fmt.Sprintf("Поставщик %s отправил поставку %s на проверку.", auth.User.Name, req.Number), now)
+		a.addAlert(restaurantID, contract.AlertLevel("warning"), fmt.Sprintf("Поставщик %s отправил поставку %s на проверку.", auth.User.Name, req.Number), now)
 	}
 	a.bumpRev()
 	supply, err := a.loadSupply(supplyID)
@@ -638,7 +660,7 @@ func (a *API) DeleteSupply(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор поставки")
 		return
 	}
-	result, err := a.DB.Exec("DELETE FROM supplies WHERE id=?", id)
+	result, err := a.DB.Exec("DELETE FROM supplies WHERE id=? AND restaurant_id=?", id, restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить поставку")
 		return
@@ -663,7 +685,8 @@ func (a *API) DeleteSupplyItem(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор продукта")
 		return
 	}
-	result, err := a.DB.Exec("DELETE FROM batches WHERE supply_id=? AND product_id=?", supplyID, productID)
+	result, err := a.DB.Exec("DELETE FROM batches WHERE supply_id=? AND product_id=? AND supply_id IN (SELECT id FROM supplies WHERE restaurant_id=?)",
+		supplyID, productID, restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить продукт из поставки")
 		return
@@ -709,7 +732,7 @@ func (a *API) WriteOffBatch(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор партии")
 		return
 	}
-	rows, err := a.loadBatchRows("WHERE b.id=?", batchID)
+	rows, err := a.loadBatchRows("WHERE b.id=? AND p.restaurant_id=?", batchID, restaurantOf(r))
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось найти партию")
 		return
@@ -735,7 +758,7 @@ func (a *API) WriteOffBatch(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось списать партию")
 		return
 	}
-	a.addAlert(contract.AlertLevel("expired"), fmt.Sprintf("Просроченный остаток продукта «%s» из поставки %s списан вручную.", batch.ProductName, batch.SupplyNumber), now)
+	a.addAlert(batch.RestaurantID, contract.AlertLevel("expired"), fmt.Sprintf("Просроченный остаток продукта «%s» из поставки %s списан вручную.", batch.ProductName, batch.SupplyNumber), now)
 	a.bumpRev()
 	a.sendJSON(w, http.StatusOK, map[string]any{
 		"id": strconv.FormatInt(batch.ID, 10), "writtenOff": batch.QtyRemaining, "qtyRemaining": 0,
@@ -759,10 +782,10 @@ func (a *API) writeSupplyItemError(w http.ResponseWriter, err error) {
 }
 
 // checkSupplyUnit — у известного продукта единица измерения уже задана и должна совпасть.
-func checkSupplyUnit(tx *sql.Tx, item contract.SupplyItemInput) error {
+func checkSupplyUnit(tx *sql.Tx, restaurantID int64, item contract.SupplyItemInput) error {
 	var name string
 	var unit contract.Unit
-	err := tx.QueryRow("SELECT name,unit FROM products WHERE norm_name=?", normalizeName(item.Name)).Scan(&name, &unit)
+	err := tx.QueryRow("SELECT name,unit FROM products WHERE restaurant_id=? AND norm_name=?", restaurantID, normalizeName(item.Name)).Scan(&name, &unit)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -776,8 +799,8 @@ func checkSupplyUnit(tx *sql.Tx, item contract.SupplyItemInput) error {
 }
 
 // queueSupplyItem сохраняет позицию поставки поставщика до решения проверяющего.
-func queueSupplyItem(tx *sql.Tx, supplyID int64, item contract.SupplyItemInput) error {
-	if err := checkSupplyUnit(tx, item); err != nil {
+func queueSupplyItem(tx *sql.Tx, restaurantID, supplyID int64, item contract.SupplyItemInput) error {
+	if err := checkSupplyUnit(tx, restaurantID, item); err != nil {
 		return err
 	}
 	lot := strings.TrimSpace(item.LotNumber)
@@ -793,15 +816,15 @@ func queueSupplyItem(tx *sql.Tx, supplyID int64, item contract.SupplyItemInput) 
 
 // insertSupplyBatch заводит позицию на склад: находит или создаёт продукт и создаёт партию,
 // срок годности которой отсчитывается от now (момента приёмки).
-func insertSupplyBatch(tx *sql.Tx, supplyID int64, item contract.SupplyItemInput, now time.Time) error {
-	if err := checkSupplyUnit(tx, item); err != nil {
+func insertSupplyBatch(tx *sql.Tx, restaurantID, supplyID int64, item contract.SupplyItemInput, now time.Time) error {
+	if err := checkSupplyUnit(tx, restaurantID, item); err != nil {
 		return err
 	}
 	norm := normalizeName(item.Name)
 	var productID int64
-	err := tx.QueryRow("SELECT id FROM products WHERE norm_name=?", norm).Scan(&productID)
+	err := tx.QueryRow("SELECT id FROM products WHERE restaurant_id=? AND norm_name=?", restaurantID, norm).Scan(&productID)
 	if err == sql.ErrNoRows {
-		res, insertErr := tx.Exec("INSERT INTO products(name,norm_name,unit) VALUES(?,?,?)", strings.TrimSpace(item.Name), norm, string(item.Unit))
+		res, insertErr := tx.Exec("INSERT INTO products(name,norm_name,unit,restaurant_id) VALUES(?,?,?,?)", strings.TrimSpace(item.Name), norm, string(item.Unit), restaurantID)
 		if insertErr != nil {
 			return insertErr
 		}
@@ -848,7 +871,8 @@ func (a *API) ReviewSupply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var number, status string
-	if err := a.DB.QueryRow("SELECT number,status FROM supplies WHERE id=?", supplyID).Scan(&number, &status); err == sql.ErrNoRows {
+	restaurantID := restaurantOf(r)
+	if err := a.DB.QueryRow("SELECT number,status FROM supplies WHERE id=? AND restaurant_id=?", supplyID, restaurantID).Scan(&number, &status); err == sql.ErrNoRows {
 		a.writeError(w, http.StatusNotFound, "Поставка не найдена")
 		return
 	} else if err != nil {
@@ -912,7 +936,7 @@ func (a *API) ReviewSupply(w http.ResponseWriter, r *http.Request) {
 		decision := "rejected"
 		if accepted[row.ID] {
 			decision = "accepted"
-			if err := insertSupplyBatch(tx, supplyID, row.Item, now); err != nil {
+			if err := insertSupplyBatch(tx, restaurantID, supplyID, row.Item, now); err != nil {
 				a.writeSupplyItemError(w, err)
 				return
 			}
@@ -943,7 +967,7 @@ func (a *API) ReviewSupply(w http.ResponseWriter, r *http.Request) {
 		contract.SupplyPartial:  "Поставка %s принята частично.",
 		contract.SupplyRejected: "Поставка %s отменена.",
 	}[newStatus]
-	a.addAlert(contract.AlertLevel("ok"), fmt.Sprintf(text, number), now)
+	a.addAlert(restaurantID, contract.AlertLevel("ok"), fmt.Sprintf(text, number), now)
 	a.bumpRev()
 	supply, err := a.loadSupply(supplyID)
 	if err != nil {

@@ -16,6 +16,7 @@ const API = (() => {
 
   const TOKEN_KEY = 'stoplist.token'
   const USER_KEY = 'stoplist.user'
+  const RESTAURANT_KEY = 'stoplist.restaurant'
 
   class ApiError extends Error {
     constructor(status, message, data) {
@@ -47,6 +48,31 @@ const API = (() => {
   function clearSession() {
     localStorage.removeItem(TOKEN_KEY)
     localStorage.removeItem(USER_KEY)
+    localStorage.removeItem(RESTAURANT_KEY)
+  }
+
+  // Ресторан, в котором идёт работа: {id, name}. Владелец выбирает его на экране выбора
+  // ресторана, поставщик — в форме поставки; у директора, менеджера и официанта это всегда
+  // их собственный ресторан. Сервер получает его заголовком X-Restaurant-Id.
+  function getRestaurant() {
+    const user = getUser()
+    if (user && user.restaurantId) return { id: user.restaurantId, name: user.restaurantName }
+    try {
+      return JSON.parse(localStorage.getItem(RESTAURANT_KEY)) || null
+    } catch {
+      return null
+    }
+  }
+
+  function setRestaurant(restaurant) {
+    if (restaurant) localStorage.setItem(RESTAURANT_KEY, JSON.stringify(restaurant))
+    else localStorage.removeItem(RESTAURANT_KEY)
+  }
+
+  function withRestaurant(headers) {
+    const restaurant = getRestaurant()
+    if (restaurant && restaurant.id) headers['X-Restaurant-Id'] = restaurant.id
+    return headers
   }
 
   // Официант и поставщик работают каждый на своей странице.
@@ -77,6 +103,7 @@ const API = (() => {
     if (body !== undefined) headers['Content-Type'] = 'application/json'
     const token = getToken()
     if (token) headers.Authorization = 'Bearer ' + token
+    withRestaurant(headers)
 
     let response
     try {
@@ -108,6 +135,7 @@ const API = (() => {
     const headers = { Accept: 'application/json' }
     const token = getToken()
     if (token) headers.Authorization = 'Bearer ' + token
+    withRestaurant(headers)
     const form = new FormData()
     form.append('file', file)
 
@@ -153,6 +181,8 @@ const API = (() => {
     del: (path) => remote('DELETE', path),
     getUser,
     roleHome,
+    getRestaurant,
+    setRestaurant,
     setSession,
     updateUser: (user) => localStorage.setItem(USER_KEY, JSON.stringify(user)),
     clearSession,
@@ -169,4 +199,10 @@ const API = (() => {
   const home = API.roleHome()
   const page = location.pathname.split('/').pop() || 'index.html'
   if (home && page !== home && page !== 'login.html') location.replace(home)
+  // Владелец сначала выбирает ресторан: без него страницам ресторана нечего показать.
+  const user = API.getUser()
+  const choosing = page === 'app.html' && /^#\/(restaurants|admin)/.test(location.hash)
+  if (user && user.role === 'owner' && !API.getRestaurant() && page !== 'login.html' && !choosing) {
+    location.replace('app.html#/restaurants')
+  }
 })()

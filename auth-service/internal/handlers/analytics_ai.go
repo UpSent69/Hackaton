@@ -40,27 +40,47 @@ type analyticsInsightResponse struct {
 //
 // Результат, признак «считается» и последняя ошибка хранятся в Redis (переживают перезапуск
 // сервера, признак «считается» снимается сам через insightTimeout); без Redis — в памяти.
-var (
-	insightMu      sync.Mutex
-	insightRev     int64 = -1
-	insightCache   analyticsInsightResponse
-	insightStarted time.Time // когда запущен анализ (запасной признак «считается» без Redis)
-	insightErr     string
-)
+var insightMu sync.Mutex
+
+// insightState — анализ одного ресторана в памяти (запасной путь без Redis).
+type insightState struct {
+	rev     int64
+	cache   analyticsInsightResponse
+	started time.Time // когда запущен анализ
+	err     string
+}
+
+var insights = map[int64]*insightState{}
+
+func insightFor(restaurantID int64) *insightState {
+	state := insights[restaurantID]
+	if state == nil {
+		state = &insightState{rev: -1}
+		insights[restaurantID] = state
+	}
+	return state
+}
+
+// insightKey — ключ Redis анализа ресторана: insight:{ресторан}:{result|running|error}.
+func insightKey(restaurantID int64, name string) string {
+	return "insight:" + strconv.FormatInt(restaurantID, 10) + ":" + name
+}
 
 // insightRequest — статистика для анализа (core → ai-service).
 type insightRequest struct {
-	Rev       int64     `json:"rev"`
-	Facts     string    `json:"facts"`
-	MenuNames []string  `json:"menuNames"`
-	Now       time.Time `json:"now"`
+	RestaurantID int64     `json:"restaurantId"`
+	Rev          int64     `json:"rev"`
+	Facts        string    `json:"facts"`
+	MenuNames    []string  `json:"menuNames"`
+	Now          time.Time `json:"now"`
 }
 
 // insightResult — готовый анализ или понятная ошибка (ai-service → core).
 type insightResult struct {
-	Rev    int64                     `json:"rev"`
-	Result *analyticsInsightResponse `json:"result,omitempty"`
-	Error  string                    `json:"error,omitempty"`
+	RestaurantID int64                     `json:"restaurantId"`
+	Rev          int64                     `json:"rev"`
+	Result       *analyticsInsightResponse `json:"result,omitempty"`
+	Error        string                    `json:"error,omitempty"`
 }
 
 const insightTimeout = 3 * time.Minute
@@ -70,43 +90,46 @@ type storedInsight struct {
 	Result analyticsInsightResponse `json:"result"`
 }
 
-func (a *API) loadInsight() (analyticsInsightResponse, int64, bool) {
-	if raw, ok := a.KV.Get("insight:result"); ok {
+func (a *API) loadInsight(restaurantID int64) (analyticsInsightResponse, int64, bool) {
+	if raw, ok := a.KV.Get(insightKey(restaurantID, "result")); ok {
 		var stored storedInsight
 		if json.Unmarshal([]byte(raw), &stored) == nil {
 			return stored.Result, stored.Rev, true
 		}
 	}
-	return insightCache, insightRev, insightRev >= 0
+	state := insightFor(restaurantID)
+	return state.cache, state.rev, state.rev >= 0
 }
 
-func (a *API) saveInsight(rev int64, result analyticsInsightResponse) {
-	insightCache, insightRev = result, rev
+func (a *API) saveInsight(restaurantID, rev int64, result analyticsInsightResponse) {
+	state := insightFor(restaurantID)
+	state.cache, state.rev = result, rev
 	if encoded, err := json.Marshal(storedInsight{Rev: rev, Result: result}); err == nil {
-		a.KV.Set("insight:result", string(encoded), 24*time.Hour)
+		a.KV.Set(insightKey(restaurantID, "result"), string(encoded), 24*time.Hour)
 	}
 }
 
-func (a *API) insightIsRunning() bool {
-	if _, ok := a.KV.Get("insight:running"); ok {
+func (a *API) insightIsRunning(restaurantID int64) bool {
+	if _, ok := a.KV.Get(insightKey(restaurantID, "running")); ok {
 		return true
 	}
-	return !insightStarted.IsZero() && time.Since(insightStarted) < insightTimeout+30*time.Second
+	started := insightFor(restaurantID).started
+	return !started.IsZero() && time.Since(started) < insightTimeout+30*time.Second
 }
 
-func (a *API) insightError() string {
-	if message, ok := a.KV.Get("insight:error"); ok {
+func (a *API) insightError(restaurantID int64) string {
+	if message, ok := a.KV.Get(insightKey(restaurantID, "error")); ok {
 		return message
 	}
-	return insightErr
+	return insightFor(restaurantID).err
 }
 
-func (a *API) setInsightError(message string) {
-	insightErr = message
+func (a *API) setInsightError(restaurantID int64, message string) {
+	insightFor(restaurantID).err = message
 	if message == "" {
-		a.KV.Del("insight:error")
+		a.KV.Del(insightKey(restaurantID, "error"))
 	} else {
-		a.KV.Set("insight:error", message, 10*time.Minute)
+		a.KV.Set(insightKey(restaurantID, "error"), message, 10*time.Minute)
 	}
 }
 
@@ -117,11 +140,12 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 	insightMu.Lock()
 	defer insightMu.Unlock()
 	pending := map[string]string{"status": "pending"}
-	cached, cachedRev, hasCached := a.loadInsight()
+	restaurantID := restaurantOf(r)
+	cached, cachedRev, hasCached := a.loadInsight(restaurantID)
 
 	if r.URL.Query().Get("poll") == "1" {
-		switch message := a.insightError(); {
-		case a.insightIsRunning():
+		switch message := a.insightError(restaurantID); {
+		case a.insightIsRunning(restaurantID):
 			a.sendJSON(w, http.StatusAccepted, pending)
 		case message != "":
 			a.writeError(w, http.StatusInternalServerError, message)
@@ -142,7 +166,7 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 		a.sendJSON(w, http.StatusOK, cached)
 		return
 	}
-	if a.insightIsRunning() {
+	if a.insightIsRunning(restaurantID) {
 		requestMu.Unlock()
 		a.sendJSON(w, http.StatusAccepted, pending)
 		return
@@ -170,19 +194,19 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Замок в Redis не даёт запустить два анализа одновременно, даже из разных процессов.
-	if acquired, ok := a.KV.SetNX("insight:running", "1", insightTimeout+30*time.Second); ok && !acquired {
+	if acquired, ok := a.KV.SetNX(insightKey(restaurantID, "running"), "1", insightTimeout+30*time.Second); ok && !acquired {
 		a.sendJSON(w, http.StatusAccepted, pending)
 		return
 	}
-	request := insightRequest{Rev: rev, Facts: facts, MenuNames: menuNames, Now: now}
+	request := insightRequest{RestaurantID: restaurantID, Rev: rev, Facts: facts, MenuNames: menuNames, Now: now}
 	if err := a.Bus.Publish(context.Background(), events.TopicAnalyticsRequests, strconv.FormatInt(rev, 10), request); err != nil {
 		log.Printf("Аналитика Qwen: Kafka недоступна: %v", err)
-		a.KV.Del("insight:running")
+		a.KV.Del(insightKey(restaurantID, "running"))
 		a.writeError(w, http.StatusServiceUnavailable, "Сервис аналитики временно недоступен, попробуйте через минуту")
 		return
 	}
-	insightStarted = time.Now()
-	a.setInsightError("")
+	insightFor(restaurantID).started = time.Now()
+	a.setInsightError(restaurantID, "")
 	a.sendJSON(w, http.StatusAccepted, pending)
 }
 
@@ -201,7 +225,7 @@ func (a *API) processInsight(value []byte) {
 	insight, err := requestimport.AnalyzeStats(ctx, request.Facts, baseURL, model)
 	log.Printf("Аналитика Qwen: время=%s, ошибка=%v", time.Since(started), err)
 
-	result := insightResult{Rev: request.Rev}
+	result := insightResult{RestaurantID: request.RestaurantID, Rev: request.Rev}
 	if err != nil {
 		result.Error = friendlyOllamaError(err, model)
 	} else {
@@ -227,13 +251,13 @@ func (a *API) storeInsightResult(value []byte) {
 	}
 	insightMu.Lock()
 	defer insightMu.Unlock()
-	insightStarted = time.Time{}
-	a.KV.Del("insight:running")
+	insightFor(result.RestaurantID).started = time.Time{}
+	a.KV.Del(insightKey(result.RestaurantID, "running"))
 	if result.Result == nil {
-		a.setInsightError(result.Error)
+		a.setInsightError(result.RestaurantID, result.Error)
 		return
 	}
-	a.saveInsight(result.Rev, *result.Result)
+	a.saveInsight(result.RestaurantID, result.Rev, *result.Result)
 }
 
 // friendlyOllamaError объясняет частые причины на компьютере, где Ollama настроена иначе.
@@ -268,11 +292,11 @@ func (a *API) analyticsFacts(r *http.Request) (string, bool, []string, error) {
 		return "", false, nil, err
 	}
 	now, _ := a.nowAndSpeed()
-	hot, err := a.computeHotOffers(now)
+	hot, err := a.computeHotOffers(restaurantOf(r), now)
 	if err != nil {
 		return "", false, nil, err
 	}
-	sales, err := a.dishSales(now)
+	sales, err := a.dishSales(restaurantOf(r), now)
 	if err != nil {
 		return "", false, nil, err
 	}
@@ -389,8 +413,8 @@ type dishSold struct{ Total, Season, Week int64 }
 
 // dishSales — сколько порций каждого блюда продано: всего, в текущем сезоне (те же месяцы любого года)
 // и за последние 7 дней по часам приложения.
-func (a *API) dishSales(now time.Time) (map[string]dishSold, error) {
-	rows, err := a.DB.Query("SELECT oi.dish_id,oi.portions,o.created_at FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.status='accepted'")
+func (a *API) dishSales(restaurantID int64, now time.Time) (map[string]dishSold, error) {
+	rows, err := a.DB.Query("SELECT oi.dish_id,oi.portions,o.created_at FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.status='accepted' AND o.restaurant_id=?", restaurantID)
 	if err != nil {
 		return nil, err
 	}

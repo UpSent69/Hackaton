@@ -156,13 +156,13 @@ func (a *API) ParseSupplyFile(w http.ResponseWriter, r *http.Request) {
 			for _, item := range document.Items {
 				names = append(names, item.ProductName)
 			}
-			if !needsModelMatch(names, a.productNames()) {
-				a.finishSupplyParse(r.Context(), w, filename, hashHex, source)
+			if !needsModelMatch(names, a.productNames(restaurantOf(r))) {
+				a.finishSupplyParse(r.Context(), w, restaurantOf(r), filename, hashHex, source)
 				return
 			}
 		}
 	}
-	a.enqueueDocument(w, "supply", filename, hashHex, source)
+	a.enqueueDocument(w, restaurantOf(r), "supply", filename, hashHex, source)
 }
 
 // isPlainTable — текстовый файл, который можно разобрать без модели.
@@ -173,7 +173,7 @@ func isPlainTable(filename string, source requestimport.Source) bool {
 
 // finishSupplyParse распознаёт накладную, сопоставляет строки с каталогом и пишет журнал
 // supply_imports. Вызывается из запроса (простые таблицы) или из очереди документов.
-func (a *API) finishSupplyParse(ctx context.Context, w http.ResponseWriter, filename, hashHex string, source requestimport.Source) {
+func (a *API) finishSupplyParse(ctx context.Context, w http.ResponseWriter, restaurantID int64, filename, hashHex string, source requestimport.Source) {
 	baseURL, model := requestimport.OllamaConfig()
 	warnings := make([]string, 0)
 	var document requestimport.SupplyDocument
@@ -215,7 +215,7 @@ func (a *API) finishSupplyParse(ctx context.Context, w http.ResponseWriter, file
 	}
 
 	requestMu.Lock()
-	products, err := a.requestCatalog()
+	products, err := a.requestCatalog(restaurantID)
 	requestMu.Unlock()
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить каталог продуктов")
@@ -305,14 +305,14 @@ func (a *API) finishSupplyParse(ctx context.Context, w http.ResponseWriter, file
 	supplyNumber := truncateRunes(strings.TrimSpace(document.SupplyNumber), 40)
 	if supplyNumber != "" {
 		var exists bool
-		if err := a.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM supplies WHERE number=?)", supplyNumber).Scan(&exists); err == nil && exists {
+		if err := a.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM supplies WHERE number=? AND restaurant_id=?)", supplyNumber, restaurantID).Scan(&exists); err == nil && exists {
 			warnings = append(warnings, fmt.Sprintf("Поставка с номером «%s» уже есть в истории. Для сохранения укажите другой номер.", supplyNumber))
 		}
 	}
 
 	duplicate := false
 	if err := a.DB.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM supply_imports WHERE source_sha256=? AND supply_id IS NOT NULL)", hashHex,
+		"SELECT EXISTS(SELECT 1 FROM supply_imports WHERE source_sha256=? AND supply_id IS NOT NULL AND restaurant_id=?)", hashHex, restaurantID,
 	).Scan(&duplicate); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось проверить повторную загрузку")
 		return
@@ -330,8 +330,8 @@ func (a *API) finishSupplyParse(ctx context.Context, w http.ResponseWriter, file
 	}
 	now, _ := a.nowAndSpeed()
 	result, err := a.DB.Exec(
-		"INSERT INTO supply_imports(source_filename,source_sha256,parser_mode,ai_used,detected_number,items_json,warnings_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
-		filename, hashHex, parserMode, aiFlag, supplyNumber, string(itemsJSON), string(warningsJSON), formatTime(now),
+		"INSERT INTO supply_imports(source_filename,source_sha256,parser_mode,ai_used,detected_number,items_json,warnings_json,created_at,restaurant_id) VALUES(?,?,?,?,?,?,?,?,?)",
+		filename, hashHex, parserMode, aiFlag, supplyNumber, string(itemsJSON), string(warningsJSON), formatTime(now), restaurantID,
 	)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось записать журнал импорта поставки")
@@ -401,10 +401,10 @@ func needsModelMatch(names, catalog []string) bool {
 	return false
 }
 
-// productNames — названия продуктов склада.
-func (a *API) productNames() []string {
+// productNames — названия продуктов склада ресторана.
+func (a *API) productNames(restaurantID int64) []string {
 	requestMu.Lock()
-	products, err := a.requestCatalog()
+	products, err := a.requestCatalog(restaurantID)
 	requestMu.Unlock()
 	if err != nil {
 		return nil
@@ -417,11 +417,11 @@ func (a *API) productNames() []string {
 }
 
 // menuDishes — блюда меню с ценой порции и числом порций, которые можно приготовить сейчас.
-func (a *API) menuDishes() ([]contract.Dish, error) {
+func (a *API) menuDishes(restaurantID int64) ([]contract.Dish, error) {
 	requestMu.Lock()
 	defer requestMu.Unlock()
 	now, _ := a.nowAndSpeed()
-	rows, err := a.DB.Query("SELECT id FROM dishes ORDER BY name COLLATE NOCASE,id")
+	rows, err := a.DB.Query("SELECT id FROM dishes WHERE restaurant_id=? ORDER BY name COLLATE NOCASE,id", restaurantID)
 	if err != nil {
 		return nil, err
 	}

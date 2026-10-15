@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Stoplist — Склад</title>
+<title>Checklist — Склад</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -355,13 +355,13 @@
   }
   .stock-bar.empty { background: rgba(255, 255, 255, 0.12); box-shadow: none; }
 </style>
-  <script src="motion.js?v=20261015-7"></script>
+  <script src="motion.js?v=20261015-14"></script>
 </head>
 <body>
 
 <nav class="nav">
   <div class="nav-left">
-    <a class="nav-logo" href="index.html">Stoplist</a>
+    <a class="nav-logo" href="index.html">Checklist</a>
     <ul class="nav-links">
       <li><a href="sclad.html" class="active">Склад</a></li>
       <li><a href="supplies.html">Поставки</a></li>
@@ -373,6 +373,7 @@
       <li><a href="app.html#/expiry">Сроки</a></li>
       <li><a href="analytics.html">Аналитика</a></li>
       <li><a href="app.html#/demo">Демо</a></li>
+      <li id="navRegister"><a href="app.html#/register">Зарегистрироваться</a></li>
     </ul>
   </div>
   <div class="nav-actions" id="navActions"></div>
@@ -415,8 +416,8 @@
   </div>
 </div>
 
-<script src="api.js?v=20261015-7"></script>
-<script src="shared.js?v=20261015-7"></script>
+<script src="api.js?v=20261015-14"></script>
+<script src="shared.js?v=20261015-14"></script>
 <script>
 // ===== ДАННЫЕ С СЕРВЕРА =====
 // Список продуктов заполняется ответами API (см. loadServerData ниже).
@@ -446,7 +447,8 @@ function renderWarehouse() {
     const stock = product.stock || [];
     for (let i = 0; i < 3; i++) {
       const s = stock[i] || { level: 'empty', percent: 0 }; // партии нет — нейтральная отметка, а не «мало»
-      const height = Math.max((s.percent || 0) * 0.28, 4); // макс 28px
+      // макс 20px: вместе с номером партии под столбиком он не достаёт до линии над строкой
+      const height = Math.max((s.percent || 0) * 0.2, 4);
       const level = s.level || 'low';
       stockHtml += `
         <div class="stock-bar-wrapper">
@@ -543,7 +545,7 @@ async function loadServerData() {
   }
 
   const user = API.getUser();
-  const isAdmin = Boolean(user && user.role === 'admin');
+  const isAdmin = Boolean(user && (user.role === 'owner' || user.role === 'director'));
   serverData.products = stock.map((item) => {
     // Партии продукта с остатком, ближайшие по сроку — первыми.
     const own = batches.filter((batch) => batch.productId === item.productId && batch.qtyRemaining > 0);
@@ -592,11 +594,22 @@ async function loadServerData() {
 
 // Кнопки шапки: «Администрирование» — только администраторам, «Выйти» — после входа,
 // «Войти» — только если сессии нет. Выход обрабатывает shared.js по атрибуту data-logout.
+// Текущий ресторан: владелец может его сменить, сотрудники видят свой.
+function restaurantLabel(user) {
+  const restaurant = API.getRestaurant();
+  if (!user || !restaurant) return '';
+  const name = UI.escapeHtml(restaurant.name);
+  return user.role === 'owner'
+    ? '<a class="nav-dashboard-btn" href="app.html#/restaurants" title="Сменить ресторан">' + name + ' · сменить</a>'
+    : '<span class="nav-dashboard-btn" style="cursor:default">' + name + '</span>';
+}
+
 function renderNavActions() {
   const user = API.getUser();
   const actions = document.getElementById('navActions');
   actions.innerHTML =
-    (user && user.role === 'admin' ? '<a class="nav-dashboard-btn" href="app.html#/admin">Администрирование</a>' : '') +
+    restaurantLabel(user) +
+    (user && (user.role === 'owner' || user.role === 'director') ? '<a class="nav-dashboard-btn" href="app.html#/admin">Администрирование</a>' : '') +
     (user ? '<button type="button" class="nav-dashboard-btn" data-logout>Выйти</button>' : '<a class="nav-dashboard-btn" href="login.html">Войти</a>');
 }
 
@@ -629,5 +642,9 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 </script>
 
+<script>
+  // «Зарегистрироваться» нужна только тому, кто ещё не вошёл.
+  if (API.getUser()) document.getElementById('navRegister').remove();
+</script>
 </body>
 </html>

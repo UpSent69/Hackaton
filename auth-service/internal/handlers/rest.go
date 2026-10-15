@@ -32,6 +32,28 @@ const authContextKey contextKey = "stoplist_auth"
 type authContext struct {
 	User    contract.User
 	TokenID string
+	// RestaurantID — ресторан, в котором выполняется запрос: у владельца и поставщика —
+	// выбранный (заголовок X-Restaurant-Id), у остальных — их собственный. 0 — не выбран.
+	RestaurantID int64
+}
+
+// restaurantOf — ресторан текущего запроса.
+func restaurantOf(r *http.Request) int64 {
+	if auth := currentAuth(r); auth != nil {
+		return auth.RestaurantID
+	}
+	return 0
+}
+
+// restaurantFree — маршруты, которым не нужен выбранный ресторан: вход, сотрудники,
+// список ресторанов, общие часы демо, результаты задач. Поставки поставщик видит и создаёт
+// сразу для всех ресторанов (ресторан указывается в самой поставке).
+var restaurantFree = map[string]bool{
+	"POST /api/auth/logout": true, "GET /api/auth/me": true,
+	"GET /api/users": true, "POST /api/users": true, "DELETE /api/users/{id}": true,
+	"GET /api/restaurants": true, "GET /api/jobs/{id}": true, "GET /api/pulse": true,
+	"GET /api/supplies": true, "POST /api/supplies": true,
+	"GET /api/demo/state": true, "POST /api/demo/clock": true, "POST /api/demo/advance": true,
 }
 
 // The warehouse demo is intentionally serialized. SQLite has one connection and this
@@ -48,7 +70,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/registration", a.Registration)
 
 	// extra — роли сотрудников (официант, поставщик), которым маршрут открыт дополнительно:
-	// администратору доступно всё, менеджеру — всё, что не adminOnly, остальным — только extra.
+	// владельцу и директору доступно всё, менеджеру — всё, что не adminOnly, остальным — только extra.
 	authed := func(method, path string, admin bool, handler http.HandlerFunc, extra ...contract.Role) {
 		mux.Handle(method+" "+path, a.protect(admin, handler, extra...))
 	}
@@ -57,7 +79,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("POST", "/api/auth/logout", false, a.Logout, waiter, supplier)
 	authed("GET", "/api/auth/me", false, a.Me, waiter, supplier)
 	authed("GET", "/api/users", true, a.Users)
-	authed("POST", "/api/users/{id}/role", true, a.SetUserRole)
+	authed("GET", "/api/restaurants", false, a.Restaurants, waiter, supplier)
 	authed("POST", "/api/users", true, a.CreateManager)
 	authed("DELETE", "/api/users/{id}", true, a.DeleteManager)
 
@@ -105,10 +127,10 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("POST", "/api/demo/reset", true, a.DemoReset)
 }
 
-// roleAllowed: администратору доступно всё, менеджеру — маршруты без adminOnly,
-// официанту и поставщику — только маршруты, где их роль указана явно.
+// roleAllowed: владельцу и директору доступно всё (директору — в своём ресторане), менеджеру —
+// маршруты без adminOnly, официанту и поставщику — только маршруты, где их роль указана явно.
 func roleAllowed(role contract.Role, adminOnly bool, extra []contract.Role) bool {
-	if role == contract.RoleAdmin {
+	if role == contract.RoleOwner || role == contract.RoleDirector {
 		return true
 	}
 	for _, allowed := range extra {
@@ -122,28 +144,64 @@ func roleAllowed(role contract.Role, adminOnly bool, extra []contract.Role) bool
 // validRole — роль, с которой можно войти.
 func validRole(role string) bool {
 	switch contract.Role(role) {
-	case contract.RoleAdmin, contract.RoleManager, contract.RoleWaiter, contract.RoleSupplier:
+	case contract.RoleOwner, contract.RoleDirector, contract.RoleManager, contract.RoleWaiter, contract.RoleSupplier:
 		return true
 	}
 	return false
+}
+
+// isHead — владелец или директор: полные права в ресторане запроса.
+func isHead(role contract.Role) bool {
+	return role == contract.RoleOwner || role == contract.RoleDirector
+}
+
+// authorize проверяет вход, права и ресторан запроса. Вызывается под requestMu.
+func (a *API) authorize(w http.ResponseWriter, r *http.Request, adminOnly bool, extra []contract.Role) (*authContext, bool) {
+	auth, err := a.authenticate(r)
+	if err != nil {
+		a.writeError(w, http.StatusUnauthorized, "Требуется вход или срок сессии истёк")
+		return nil, false
+	}
+	if !roleAllowed(auth.User.Role, adminOnly, extra) {
+		a.writeError(w, http.StatusForbidden, "Недостаточно прав для выполнения операции")
+		return nil, false
+	}
+	auth.RestaurantID = a.requestRestaurant(r, auth.User)
+	if auth.RestaurantID == 0 && !restaurantFree[r.Pattern] {
+		a.writeError(w, http.StatusBadRequest, "Выберите ресторан")
+		return nil, false
+	}
+	if err := a.maintainIfOwner(); err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось обновить состояние склада")
+		return nil, false
+	}
+	return auth, true
+}
+
+// requestRestaurant: владелец и поставщик выбирают ресторан заголовком X-Restaurant-Id,
+// остальные всегда работают в своём ресторане (заголовок игнорируется).
+func (a *API) requestRestaurant(r *http.Request, user contract.User) int64 {
+	if user.Role != contract.RoleOwner && user.Role != contract.RoleSupplier {
+		id, _ := strconv.ParseInt(user.RestaurantID, 10, 64)
+		return id
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(r.Header.Get("X-Restaurant-Id")), 10, 64)
+	if err != nil || id <= 0 {
+		return 0
+	}
+	var exists int
+	if a.DB.QueryRow("SELECT COUNT(*) FROM restaurants WHERE id=?", id).Scan(&exists) != nil || exists == 0 {
+		return 0
+	}
+	return id
 }
 
 func (a *API) protect(adminOnly bool, next http.HandlerFunc, extra ...contract.Role) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestMu.Lock()
 		defer requestMu.Unlock()
-
-		auth, err := a.authenticate(r)
-		if err != nil {
-			a.writeError(w, http.StatusUnauthorized, "Требуется вход или срок сессии истёк")
-			return
-		}
-		if !roleAllowed(auth.User.Role, adminOnly, extra) {
-			a.writeError(w, http.StatusForbidden, "Недостаточно прав для выполнения операции")
-			return
-		}
-		if err := a.maintainIfOwner(); err != nil {
-			a.writeError(w, http.StatusInternalServerError, "Не удалось обновить состояние склада")
+		auth, ok := a.authorize(w, r, adminOnly, extra)
+		if !ok {
 			return
 		}
 		ctx := context.WithValue(r.Context(), authContextKey, auth)
@@ -156,24 +214,12 @@ func (a *API) protect(adminOnly bool, next http.HandlerFunc, extra ...contract.R
 func (a *API) protectLongRunning(adminOnly bool, next http.HandlerFunc, extra ...contract.Role) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestMu.Lock()
-		auth, err := a.authenticate(r)
-		if err != nil {
-			requestMu.Unlock()
-			a.writeError(w, http.StatusUnauthorized, "Требуется вход или срок сессии истёк")
-			return
-		}
-		if !roleAllowed(auth.User.Role, adminOnly, extra) {
-			requestMu.Unlock()
-			a.writeError(w, http.StatusForbidden, "Недостаточно прав для выполнения операции")
-			return
-		}
-		if err := a.maintainIfOwner(); err != nil {
-			requestMu.Unlock()
-			a.writeError(w, http.StatusInternalServerError, "Не удалось обновить состояние склада")
+		auth, ok := a.authorize(w, r, adminOnly, extra)
+		requestMu.Unlock()
+		if !ok {
 			return
 		}
 		ctx := context.WithValue(r.Context(), authContextKey, auth)
-		requestMu.Unlock()
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -207,29 +253,18 @@ func (a *API) authenticate(r *http.Request) (*authContext, error) {
 		return nil, errors.New("invalid session claim")
 	}
 
-	// Быстрый путь: сессия в Redis (живёт до истечения токена). Пользователь и роль всё равно
-	// читаются из SQLite, чтобы смена роли действовала сразу.
-	if uid, ok := a.KV.Get("session:" + tokenID); ok && uid == strconv.FormatInt(int64(idValue), 10) {
-		var user contract.User
-		var userID int64
-		var role string
-		if err := a.DB.QueryRow("SELECT id,name,email,role FROM accounts WHERE id=?", int64(idValue)).Scan(&userID, &user.Name, &user.Email, &role); err == nil &&
-			validRole(role) {
-			user.ID = strconv.FormatInt(userID, 10)
-			user.Role = contract.Role(role)
+	// Быстрый путь: сессия в Redis (живёт до истечения токена). Пользователь, роль и ресторан
+	// всё равно читаются из SQLite, чтобы изменения действовали сразу.
+	id := int64(idValue)
+	if uid, ok := a.KV.Get("session:" + tokenID); ok && uid == strconv.FormatInt(id, 10) {
+		if user, err := a.loadUser(id); err == nil {
 			return &authContext{User: user, TokenID: tokenID}, nil
 		}
 	}
 
-	var id int64
-	var name, email, role, expiresAt string
+	var expiresAt string
 	var revoked int
-	err = a.DB.QueryRow(
-		"SELECT a.id, a.name, a.email, a.role, s.expires_at, s.revoked "+
-			"FROM accounts a JOIN auth_sessions s ON s.user_id = a.id "+
-			"WHERE a.id = ? AND s.jti = ?",
-		int64(idValue), tokenID,
-	).Scan(&id, &name, &email, &role, &expiresAt, &revoked)
+	err = a.DB.QueryRow("SELECT expires_at, revoked FROM auth_sessions WHERE user_id = ? AND jti = ?", id, tokenID).Scan(&expiresAt, &revoked)
 	if err != nil || revoked != 0 {
 		return nil, errors.New("session not found")
 	}
@@ -237,14 +272,37 @@ func (a *API) authenticate(r *http.Request) (*authContext, error) {
 	if err != nil || !time.Now().UTC().Before(expiration) {
 		return nil, errors.New("session expired")
 	}
-	if !validRole(role) {
-		return nil, errors.New("invalid role")
+	user, err := a.loadUser(id)
+	if err != nil {
+		return nil, err
 	}
 	a.rememberSession(tokenID, id, time.Until(expiration))
-	return &authContext{
-		User: contract.User{ID: strconv.FormatInt(id, 10), Name: name, Email: email, Role: contract.Role(role)},
-		TokenID: tokenID,
-	}, nil
+	return &authContext{User: user, TokenID: tokenID}, nil
+}
+
+// loadUser читает аккаунт вместе с его рестораном.
+func (a *API) loadUser(id int64) (contract.User, error) {
+	var user contract.User
+	var role string
+	var restaurantID sql.NullInt64
+	var restaurantName sql.NullString
+	err := a.DB.QueryRow(
+		"SELECT a.id,a.name,a.email,a.role,a.restaurant_id,r.name FROM accounts a "+
+			"LEFT JOIN restaurants r ON r.id=a.restaurant_id WHERE a.id=?", id,
+	).Scan(&id, &user.Name, &user.Email, &role, &restaurantID, &restaurantName)
+	if err != nil {
+		return user, err
+	}
+	if !validRole(role) {
+		return user, errors.New("invalid role")
+	}
+	user.ID = strconv.FormatInt(id, 10)
+	user.Role = contract.Role(role)
+	if restaurantID.Valid {
+		user.RestaurantID = strconv.FormatInt(restaurantID.Int64, 10)
+		user.RestaurantName = restaurantName.String
+	}
+	return user, nil
 }
 
 func currentAuth(r *http.Request) *authContext {
@@ -289,18 +347,18 @@ func (a *API) Register(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось создать пароль")
 		return
 	}
-	// Самостоятельно регистрируются только первые два администратора.
-	// Менеджеров заводит администратор на странице «Администрирование».
+	// Самостоятельно регистрируются только владельцы сети — первые два аккаунта.
+	// Директоров, сотрудников и поставщика заводят на странице «Администрирование».
 	open, err := a.registrationOpen()
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось проверить пользователей")
 		return
 	}
 	if !open {
-		a.writeError(w, http.StatusForbidden, "Регистрация закрыта: аккаунт менеджера выдаёт администратор")
+		a.writeError(w, http.StatusForbidden, "Регистрация закрыта: аккаунты выдаёт владелец или директор ресторана")
 		return
 	}
-	role := contract.RoleAdmin
+	role := contract.RoleOwner
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := a.DB.Exec(
 		"INSERT INTO accounts(name,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
@@ -349,7 +407,11 @@ func (a *API) Login(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusUnauthorized, "Логин или пароль неверны")
 		return
 	}
-	user := contract.User{ID: strconv.FormatInt(id, 10), Name: name, Email: storedEmail, Role: contract.Role(role)}
+	user, err := a.loadUser(id)
+	if err != nil {
+		a.writeError(w, http.StatusUnauthorized, "Логин или пароль неверны")
+		return
+	}
 	session, err := a.createSession(id, user)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось открыть сессию")
@@ -428,66 +490,67 @@ func (a *API) Me(w http.ResponseWriter, r *http.Request) {
 	a.sendJSON(w, http.StatusOK, auth.User)
 }
 
+// Users — владелец видит все аккаунты сети, директор — сотрудников своего ресторана.
 func (a *API) Users(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.DB.Query("SELECT id,name,email,role FROM accounts ORDER BY name COLLATE NOCASE,email COLLATE NOCASE")
+	auth := currentAuth(r)
+	query := "SELECT a.id FROM accounts a"
+	args := []any{}
+	if auth.User.Role != contract.RoleOwner {
+		query += " WHERE a.restaurant_id=?"
+		args = append(args, auth.User.RestaurantID)
+	}
+	rows, err := a.DB.Query(query+" ORDER BY a.restaurant_id IS NOT NULL, a.restaurant_id, a.name COLLATE NOCASE", args...)
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить пользователей")
 		return
 	}
-	defer rows.Close()
-	users := make([]contract.User, 0)
+	ids := make([]int64, 0)
 	for rows.Next() {
 		var id int64
-		var user contract.User
-		var role string
-		if err := rows.Scan(&id, &user.Name, &user.Email, &role); err != nil {
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			a.writeError(w, http.StatusInternalServerError, "Не удалось прочитать пользователей")
 			return
 		}
-		user.ID = strconv.FormatInt(id, 10)
-		user.Role = contract.Role(role)
-		users = append(users, user)
+		ids = append(ids, id)
 	}
-	if err := rows.Err(); err != nil {
-		a.writeError(w, http.StatusInternalServerError, "Не удалось прочитать пользователей")
-		return
+	rows.Close()
+	users := make([]contract.User, 0, len(ids))
+	for _, id := range ids {
+		user, err := a.loadUser(id)
+		if err != nil {
+			continue
+		}
+		users = append(users, user)
 	}
 	a.sendJSON(w, http.StatusOK, users)
 }
 
-func (a *API) SetUserRole(w http.ResponseWriter, r *http.Request) {
+// Restaurants — рестораны, доступные пользователю: владельцу и поставщику — все, остальным — свой.
+func (a *API) Restaurants(w http.ResponseWriter, r *http.Request) {
 	auth := currentAuth(r)
-	id := strings.TrimSpace(r.PathValue("id"))
-	if auth == nil || id == auth.User.ID {
-		a.writeError(w, http.StatusBadRequest, "Нельзя менять собственную роль")
-		return
+	query, args := "SELECT id,name FROM restaurants ORDER BY id", []any{}
+	if auth.User.Role != contract.RoleOwner && auth.User.Role != contract.RoleSupplier {
+		query, args = "SELECT id,name FROM restaurants WHERE id=?", []any{auth.User.RestaurantID}
 	}
-	var req contract.SetRoleRequest
-	if err := decodeJSON(w, r, &req); err != nil || !validRole(string(req.Role)) {
-		a.writeError(w, http.StatusBadRequest, "Выберите роль: admin, manager, waiter или supplier")
-		return
-	}
-	result, err := a.DB.Exec("UPDATE accounts SET role=? WHERE id=?", string(req.Role), id)
+	rows, err := a.DB.Query(query, args...)
 	if err != nil {
-		a.writeError(w, http.StatusInternalServerError, "Не удалось изменить роль")
+		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить рестораны")
 		return
 	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		a.writeError(w, http.StatusNotFound, "Пользователь не найден")
-		return
+	defer rows.Close()
+	result := make([]contract.Restaurant, 0)
+	for rows.Next() {
+		var id int64
+		var item contract.Restaurant
+		if err := rows.Scan(&id, &item.Name); err != nil {
+			a.writeError(w, http.StatusInternalServerError, "Не удалось прочитать рестораны")
+			return
+		}
+		item.ID = strconv.FormatInt(id, 10)
+		result = append(result, item)
 	}
-	a.bumpRev()
-	var uid int64
-	var user contract.User
-	var role string
-	if err := a.DB.QueryRow("SELECT id,name,email,role FROM accounts WHERE id=?", id).Scan(&uid, &user.Name, &user.Email, &role); err != nil {
-		a.writeError(w, http.StatusInternalServerError, "Не удалось прочитать пользователя")
-		return
-	}
-	user.ID = strconv.FormatInt(uid, 10)
-	user.Role = contract.Role(role)
-	a.sendJSON(w, http.StatusOK, user)
+	a.sendJSON(w, http.StatusOK, result)
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target interface{}) error {
@@ -639,11 +702,12 @@ func safeRowsErr(rows *sql.Rows) error {
 
 var managerLoginPattern = regexp.MustCompile(`^[a-z0-9._-]{3,64}$`)
 
-// registrationOpen — регистрация открыта, пока в системе меньше двух администраторов.
+// registrationOpen — регистрация открыта, пока владельцев меньше двух: владельцами
+// становятся первые два зарегистрированных аккаунта.
 func (a *API) registrationOpen() (bool, error) {
-	var admins int
-	err := a.DB.QueryRow("SELECT COUNT(*) FROM accounts WHERE role=?", string(contract.RoleAdmin)).Scan(&admins)
-	return admins < 2, err
+	var owners int
+	err := a.DB.QueryRow("SELECT COUNT(*) FROM accounts WHERE role=?", string(contract.RoleOwner)).Scan(&owners)
+	return owners < 2, err
 }
 
 // Registration сообщает форме входа, показывать ли ссылку на регистрацию.
@@ -658,9 +722,11 @@ func (a *API) Registration(w http.ResponseWriter, r *http.Request) {
 	a.sendJSON(w, http.StatusOK, contract.RegistrationState{Open: open})
 }
 
-// CreateManager — администратор заводит менеджера по логину и паролю. Логин хранится
-// в том же поле, что и почта администратора, поэтому входит менеджер через ту же форму.
+// CreateManager заводит аккаунт по логину и паролю. Владелец создаёт директоров (по одному
+// на ресторан), менеджеров и официантов любого ресторана и общего поставщика; директор —
+// менеджеров и официантов своего ресторана. Логин хранится в поле почты, вход — через ту же форму.
 func (a *API) CreateManager(w http.ResponseWriter, r *http.Request) {
+	auth := currentAuth(r)
 	var req contract.CreateManagerRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		a.writeError(w, http.StatusBadRequest, "Укажите логин и пароль")
@@ -683,9 +749,41 @@ func (a *API) CreateManager(w http.ResponseWriter, r *http.Request) {
 	if role == "" {
 		role = contract.RoleManager
 	}
-	if role != contract.RoleManager && role != contract.RoleWaiter && role != contract.RoleSupplier {
-		a.writeError(w, http.StatusBadRequest, "Роль сотрудника: менеджер, официант или поставщик")
+	owner := auth.User.Role == contract.RoleOwner
+	switch {
+	case role == contract.RoleManager || role == contract.RoleWaiter:
+	case owner && (role == contract.RoleDirector || role == contract.RoleSupplier):
+	case owner:
+		a.writeError(w, http.StatusBadRequest, "Роль: директор, менеджер, официант или поставщик")
 		return
+	default:
+		a.writeError(w, http.StatusForbidden, "Директор заводит только менеджеров и официантов своего ресторана")
+		return
+	}
+
+	var restaurant any // у поставщика ресторана нет
+	if role != contract.RoleSupplier {
+		restaurantID := auth.User.RestaurantID
+		if owner {
+			restaurantID = strings.TrimSpace(req.RestaurantID)
+		}
+		var exists int
+		if a.DB.QueryRow("SELECT COUNT(*) FROM restaurants WHERE id=?", restaurantID).Scan(&exists); exists == 0 {
+			a.writeError(w, http.StatusBadRequest, "Выберите ресторан сотрудника")
+			return
+		}
+		restaurant = restaurantID
+		if role == contract.RoleDirector {
+			var directors int
+			if err := a.DB.QueryRow("SELECT COUNT(*) FROM accounts WHERE role='director' AND restaurant_id=?", restaurantID).Scan(&directors); err != nil {
+				a.writeError(w, http.StatusInternalServerError, "Не удалось проверить директора")
+				return
+			}
+			if directors > 0 {
+				a.writeError(w, http.StatusConflict, "У этого ресторана уже есть директор")
+				return
+			}
+		}
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -693,8 +791,8 @@ func (a *API) CreateManager(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := a.DB.Exec(
-		"INSERT INTO accounts(name,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
-		login, login, string(hash), string(role), time.Now().UTC().Format(time.RFC3339Nano),
+		"INSERT INTO accounts(name,email,password_hash,role,created_at,restaurant_id) VALUES(?,?,?,?,?,?)",
+		login, login, string(hash), string(role), time.Now().UTC().Format(time.RFC3339Nano), restaurant,
 	)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "constraint") {
@@ -710,29 +808,40 @@ func (a *API) CreateManager(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.bumpRev()
-	a.sendJSON(w, http.StatusCreated, contract.User{ID: strconv.FormatInt(id, 10), Name: login, Email: login, Role: role})
+	user, err := a.loadUser(id)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Сотрудник создан, но его не удалось прочитать")
+		return
+	}
+	a.sendJSON(w, http.StatusCreated, user)
 }
 
-// DeleteManager удаляет менеджера вместе с его сессиями. Администраторов так удалить нельзя.
+// DeleteManager удаляет аккаунт вместе с сессиями. Владелец удаляет любого, кроме себя;
+// директор — менеджеров и официантов своего ресторана.
 func (a *API) DeleteManager(w http.ResponseWriter, r *http.Request) {
+	auth := currentAuth(r)
 	id, err := parseID(r.PathValue("id"))
 	if err != nil {
 		a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор пользователя")
 		return
 	}
+	condition, args := "id=? AND role<>'owner'", []any{id}
+	if auth.User.Role != contract.RoleOwner {
+		condition, args = "id=? AND role IN ('manager','waiter') AND restaurant_id=?", []any{id, auth.User.RestaurantID}
+	}
+	var found int
+	if err := a.DB.QueryRow("SELECT COUNT(*) FROM accounts WHERE "+condition, args...).Scan(&found); err != nil || found == 0 {
+		a.writeError(w, http.StatusNotFound, "Сотрудник не найден")
+		return
+	}
 	// Сессии удаляются явно, не полагаясь только на каскад внешнего ключа.
 	a.forgetSessions(id)
-	if _, err := a.DB.Exec("DELETE FROM auth_sessions WHERE user_id IN (SELECT id FROM accounts WHERE id=? AND role<>'admin')", id); err != nil {
+	if _, err := a.DB.Exec("DELETE FROM auth_sessions WHERE user_id=?", id); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить пользователя")
 		return
 	}
-	result, err := a.DB.Exec("DELETE FROM accounts WHERE id=? AND role<>'admin'", id)
-	if err != nil {
+	if _, err := a.DB.Exec("DELETE FROM accounts WHERE "+condition, args...); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить пользователя")
-		return
-	}
-	if affected, _ := result.RowsAffected(); affected == 0 {
-		a.writeError(w, http.StatusNotFound, "Сотрудник не найден")
 		return
 	}
 	a.bumpRev()

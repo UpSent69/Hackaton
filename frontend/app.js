@@ -107,9 +107,20 @@
   ]
   const PAGES = Object.fromEntries(NAV.filter((item) => item[2]).map((item) => [item[0], item[2]]))
 
+  // Владелец и директор — полные права в ресторане.
   const isAdmin = () => {
     const user = API.getUser()
-    return Boolean(user && user.role === 'admin')
+    return Boolean(user && (user.role === 'owner' || user.role === 'director'))
+  }
+  const isOwner = () => (API.getUser() || {}).role === 'owner'
+
+  // Текущий ресторан в шапке: владелец может его сменить, сотрудники видят свой.
+  function restaurantChip(user) {
+    const restaurant = API.getRestaurant()
+    if (!user || !restaurant || user.role === 'supplier') return ''
+    return user.role === 'owner'
+      ? `<a class="btn btn-line btn-sm" href="#/restaurants" title="Сменить ресторан">${escapeHtml(restaurant.name)} · сменить</a>`
+      : `<span class="label tag">${escapeHtml(restaurant.name)}</span>`
   }
 
   const burger = document.getElementById('burger')
@@ -117,15 +128,18 @@
 
   function renderNav(current) {
     const user = API.getUser()
-    const links = NAV.map(([path, label, page]) => `<a href="${page || '#/' + path}"${path === current ? ' class="active"' : ''}>${label}</a>`).join('')
+    const links = NAV.map(([path, label, page]) => `<a href="${page || '#/' + path}"${path === current ? ' class="active"' : ''}>${label}</a>`).join('') +
+      (user ? '' : `<a href="#/register"${current === 'register' ? ' class="active"' : ''}>Зарегистрироваться</a>`)
     document.getElementById('navLinks').innerHTML = links
     const admin = isAdmin()
     document.getElementById('navActions').innerHTML =
       `<span class="nav-user" title="${escapeHtml(user?.email || '')}">${escapeHtml(user?.name || 'Сессия определяется сервером')}</span>
+       ${restaurantChip(user)}
        ${admin ? `<a class="btn btn-line btn-sm${current === 'admin' ? ' active' : ''}" href="#/admin">Администрирование</a>` : ''}
        <span class="label tag clock-chip" id="clockChip" hidden></span>
        ${user ? '<button type="button" class="btn btn-line btn-sm" data-logout>Выйти</button>' : '<a class="btn btn-solid btn-sm" href="login.html">Войти</a>'}`
     menu.innerHTML = links + '<div class="divider"></div>' +
+      (isOwner() ? '<a href="#/restaurants">Сменить ресторан</a>' : '') +
       (admin ? '<a href="#/admin">Администрирование</a>' : '') +
       (user ? '<a href="index.html" data-logout>Завершить сессию</a>' : '<a href="login.html">Войти</a>')
   }
@@ -500,28 +514,70 @@
 
   /* ---------- Администрирование: кто может изменять данные ---------- */
 
-  const ROLE_LABEL = { admin: 'Администратор', manager: 'Менеджер', waiter: 'Официант', supplier: 'Поставщик' }
+  const ROLE_LABEL = { owner: 'Владелец', director: 'Директор', manager: 'Менеджер', waiter: 'Официант', supplier: 'Поставщик' }
   const roleBadge = (role) =>
-    `<span class="label status" style="--status-color:${role === 'admin' ? STATUS.ok.color : 'rgba(255,255,255,0.3)'}">${ROLE_LABEL[role] || role}</span>`
+    `<span class="label status" style="--status-color:${role === 'owner' || role === 'director' ? STATUS.ok.color : 'rgba(255,255,255,0.3)'}">${ROLE_LABEL[role] || role}</span>`
 
-  async function adminView() {
-    // Менеджерам страница не нужна: пользователей видит и заводит только администратор.
-    if (!isAdmin()) {
-      view.innerHTML = `<main class="page">${pageHeader('Администрирование', '')}<div class="glass empty"><h3>Нет прав</h3><p>Управлять пользователями может только администратор.</p></div></main>`
+  /* ---------- Выбор ресторана (владелец) ---------- */
+
+  async function restaurantsView() {
+    view.innerHTML = `<main class="page">
+      ${pageHeader('Рестораны', 'Выберите ресторан — в нём доступны все разделы сайта с полными правами. Сменить ресторан можно в шапке.')}
+      <div id="restaurantList">${loading()}</div>
+    </main>`
+    const list = document.getElementById('restaurantList')
+    let restaurants
+    try {
+      restaurants = await call(API.get('/restaurants'))
+    } catch (error) {
+      list.innerHTML = `<div class="glass empty"><h3>Не удалось загрузить рестораны</h3><p>${escapeHtml(error.message)}</p></div>`
       return
     }
+    const current = API.getRestaurant()
+    list.innerHTML = `<div class="stop-summary">${restaurants
+      .map((restaurant) => `<button type="button" class="glass stat" data-restaurant="${escapeHtml(restaurant.id)}" data-name="${escapeHtml(restaurant.name)}"
+          style="cursor:pointer;text-align:left;font:inherit;color:inherit${current && current.id === restaurant.id ? ';outline:1px solid rgba(255,255,255,0.6)' : ''}">
+          <div class="big" style="font-size:28px">${escapeHtml(restaurant.name)}</div>
+          <div class="small">${current && current.id === restaurant.id ? 'сейчас открыт · войти' : 'войти'}</div>
+        </button>`)
+      .join('')}</div>`
+    list.addEventListener('click', (event) => {
+      const card = event.target.closest('[data-restaurant]')
+      if (!card) return
+      API.setRestaurant({ id: card.dataset.restaurant, name: card.dataset.name })
+      location.href = 'index.html'
+    })
+  }
+
+  /* ---------- Администрирование: сотрудники сети ---------- */
+
+  async function adminView() {
+    // Сотрудников заводят владелец (во всех ресторанах) и директор (в своём).
+    if (!isAdmin()) {
+      view.innerHTML = `<main class="page">${pageHeader('Администрирование', '')}<div class="glass empty"><h3>Нет прав</h3><p>Управлять сотрудниками могут владелец и директор ресторана.</p></div></main>`
+      return
+    }
+    const me = API.getUser()
+    const owner = me.role === 'owner'
+    const roles = owner ? ['director', 'manager', 'waiter', 'supplier'] : ['manager', 'waiter']
+    let restaurants = []
+    if (owner) restaurants = await call(API.get('/restaurants')).catch(() => [])
+    const current = API.getRestaurant()
     view.innerHTML = `<main class="page">
-      ${pageHeader('Администрирование', 'Первые два зарегистрированных пользователя — администраторы: принимают и удаляют поставки, сохраняют заявки, ведут меню, оформляют заказы. Менеджеры видят все данные на сайте, но не меняют их. Официанту доступна только страница «Заказы» (оформляет заказы), поставщику — только «Поставки» (принимает и импортирует поставки).')}
+      ${pageHeader('Администрирование', owner
+        ? 'Владелец заводит директоров (по одному на ресторан), менеджеров и официантов любого ресторана и общего поставщика. Директор полностью управляет своим рестораном и заводит его менеджеров и официантов.'
+        : `Сотрудники ресторана «${escapeHtml(me.restaurantName || '')}». Менеджер видит данные и рассматривает поставки, официант оформляет заказы.`)}
       <form class="glass form" id="managerForm" novalidate style="margin-bottom:32px">
         <h2 class="panel-title">Добавить сотрудника</h2>
-        <div class="supply-row" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 0.8fr) auto">
+        <div class="supply-row" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 0.8fr)${owner ? ' minmax(0, 0.8fr)' : ''} auto">
           <label class="field"><span class="label">Логин</span><input class="input" name="login" autocomplete="off" placeholder="Например, ivanov" /></label>
           <label class="field"><span class="label">Пароль</span><input class="input" name="password" type="password" autocomplete="new-password" placeholder="Не короче 6 символов" /></label>
           <label class="field"><span class="label">Роль</span><select class="input" name="role">
-            <option value="manager">Менеджер</option>
-            <option value="waiter">Официант</option>
-            <option value="supplier">Поставщик</option>
+            ${roles.map((role) => `<option value="${role}"${role === 'manager' ? ' selected' : ''}>${ROLE_LABEL[role]}</option>`).join('')}
           </select></label>
+          ${owner ? `<label class="field" data-restaurant-field><span class="label">Ресторан</span><select class="input" name="restaurantId">
+            ${restaurants.map((restaurant) => `<option value="${escapeHtml(restaurant.id)}"${current && current.id === restaurant.id ? ' selected' : ''}>${escapeHtml(restaurant.name)}</option>`).join('')}
+          </select></label>` : ''}
           <button type="submit" class="btn btn-solid">Создать</button>
         </div>
         <span class="form-msg" id="managerMsg" role="status"></span>
@@ -535,7 +591,8 @@
 
     const body = document.getElementById('usersBody')
     const message = document.getElementById('usersMsg')
-    const me = API.getUser()
+    // Кого можно удалить: владелец — любого, кроме себя; директор — менеджеров и официантов.
+    const canDelete = (user) => user.id !== me.id && (owner ? user.role !== 'owner' : user.role === 'manager' || user.role === 'waiter')
 
     async function loadUsers() {
       let users
@@ -545,32 +602,24 @@
         body.innerHTML = `<div class="glass empty"><h3>Не удалось загрузить пользователей</h3><p>${escapeHtml(error.message)}</p></div>`
         return
       }
-      const admins = users.filter((user) => user.role === 'admin').length
+      const count = (role) => users.filter((user) => user.role === role).length
       body.innerHTML = `
         <div class="stop-summary" style="margin-bottom:20px">
           <div class="glass stat"><div class="big">${users.length}</div><div class="small">всего аккаунтов</div></div>
-          <div class="glass stat"><div class="big">${admins}</div><div class="small">могут изменять данные</div></div>
-          <div class="glass stat"><div class="big">${users.length - admins}</div><div class="small">сотрудников с ограниченным доступом</div></div>
+          <div class="glass stat"><div class="big">${owner ? count('director') : count('manager')}</div><div class="small">${owner ? 'директоров' : 'менеджеров'}</div></div>
+          <div class="glass stat"><div class="big">${count('waiter')}</div><div class="small">официантов</div></div>
         </div>
         <div class="glass table-wrap"><table class="table">
-          <thead><tr><th>Имя</th><th>Почта</th><th>Роль</th><th></th></tr></thead>
+          <thead><tr><th>Имя</th><th>Логин</th><th>Роль</th><th>Ресторан</th><th></th></tr></thead>
           <tbody>
             ${users
-              .map((user) => {
-                const isMe = user.id === me.id
-                const action = isMe
-                  ? '<span class="dim">это вы</span>'
-                  : user.role === 'admin'
-                    ? `<button type="button" class="btn btn-sm btn-line" data-role="manager" data-confirm="Точно снять?">Сделать менеджером</button>`
-                    : `<button type="button" class="btn btn-sm btn-solid" data-role="admin">Сделать администратором</button>
-                       <button type="button" class="btn btn-sm btn-line" data-delete data-confirm="Точно удалить?">Удалить</button>`
-                return `<tr data-user="${escapeHtml(user.id)}" data-name="${escapeHtml(user.name)}">
+              .map((user) => `<tr data-user="${escapeHtml(user.id)}" data-name="${escapeHtml(user.name)}">
                   <td class="strong">${escapeHtml(user.name)}</td>
                   <td class="dim">${escapeHtml(user.email)}</td>
                   <td>${roleBadge(user.role)}</td>
-                  <td class="num">${action}</td>
-                </tr>`
-              })
+                  <td class="dim">${user.restaurantName ? escapeHtml(user.restaurantName) : 'все рестораны'}</td>
+                  <td class="num">${user.id === me.id ? '<span class="dim">это вы</span>' : canDelete(user) ? '<button type="button" class="btn btn-sm btn-line" data-delete data-confirm="Точно удалить?">Удалить</button>' : ''}</td>
+                </tr>`)
               .join('')}
           </tbody>
         </table></div>
@@ -579,11 +628,19 @@
 
     const managerForm = document.getElementById('managerForm')
     const managerMsg = document.getElementById('managerMsg')
+    const restaurantField = managerForm.querySelector('[data-restaurant-field]')
+    // Поставщик общий для всех ресторанов — ресторан ему не выбирается.
+    const syncRestaurantField = () => {
+      if (restaurantField) restaurantField.style.visibility = managerForm.elements.role.value === 'supplier' ? 'hidden' : 'visible'
+    }
+    managerForm.elements.role.addEventListener('change', syncRestaurantField)
+    syncRestaurantField()
     managerForm.addEventListener('submit', async (event) => {
       event.preventDefault()
       const login = managerForm.elements.login.value.trim().toLowerCase()
       const password = managerForm.elements.password.value
       const role = managerForm.elements.role.value
+      const restaurantId = owner && role !== 'supplier' ? managerForm.elements.restaurantId.value : undefined
       managerForm.querySelectorAll('.input').forEach((input) => input.classList.remove('is-invalid'))
       if (!/^[a-z0-9._-]{3,64}$/.test(login)) {
         managerForm.elements.login.classList.add('is-invalid')
@@ -598,9 +655,10 @@
       const submit = managerForm.querySelector('[type=submit]')
       submit.disabled = true
       try {
-        await call(API.post('/users', { login, password, role }))
-        setMessage(managerMsg, `${ROLE_LABEL[role]} ${login} создан — можно войти с этим логином и паролем`)
+        const user = await call(API.post('/users', { login, password, role, restaurantId }))
+        setMessage(managerMsg, `${ROLE_LABEL[role]} ${login}${user.restaurantName ? ' (' + user.restaurantName + ')' : ''} создан — можно войти с этим логином и паролем`)
         managerForm.reset()
+        syncRestaurantField()
         await loadUsers()
       } catch (error) {
         setMessage(managerMsg, error.message, true)
@@ -611,33 +669,16 @@
 
     body.addEventListener('click', async (event) => {
       const remove = event.target.closest('[data-delete]')
-      if (remove) {
-        if (!confirmClick(remove)) return
-        const row = remove.closest('tr')
-        remove.disabled = true
-        try {
-          await call(API.del('/users/' + encodeURIComponent(row.dataset.user)))
-          setMessage(message, `${row.dataset.name} удалён`)
-          await loadUsers()
-        } catch (error) {
-          setMessage(message, error.message, true)
-          remove.disabled = false
-        }
-        return
-      }
-      const button = event.target.closest('[data-role]')
-      if (!button) return
-      // Снятие прав — в два нажатия, выдача — сразу.
-      if (button.hasAttribute('data-confirm') && !confirmClick(button)) return
-      const row = button.closest('tr')
-      button.disabled = true
+      if (!remove || !confirmClick(remove)) return
+      const row = remove.closest('tr')
+      remove.disabled = true
       try {
-        await call(API.post('/users/' + encodeURIComponent(row.dataset.user) + '/role', { role: button.dataset.role }))
-        setMessage(message, button.dataset.role === 'admin' ? `${row.dataset.name} теперь администратор` : `${row.dataset.name} теперь менеджер`)
+        await call(API.del('/users/' + encodeURIComponent(row.dataset.user)))
+        setMessage(message, `${row.dataset.name} удалён`)
         await loadUsers()
       } catch (error) {
         setMessage(message, error.message, true)
-        button.disabled = false
+        remove.disabled = false
       }
     })
 
@@ -1009,6 +1050,11 @@
       location.replace('index.html')
       return
     }
+    // Владелец сначала выбирает ресторан.
+    if (isOwner() && !API.getRestaurant() && !['restaurants', 'admin', 'login', 'register'].includes(path)) {
+      location.replace('#/restaurants')
+      return
+    }
     // Экран переехал в отдельный файл — отправляем туда, сохранив параметры.
     if (PAGES[path]) {
       location.replace(PAGES[path] + (rawQuery ? '?' + rawQuery : ''))
@@ -1035,6 +1081,7 @@
     }
     else if (path === 'demo') open(demoView)
     else if (path === 'admin') adminView()
+    else if (path === 'restaurants') restaurantsView()
     else placeholderView(path)
     pulse()
   }
