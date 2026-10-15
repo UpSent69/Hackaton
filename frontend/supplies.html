@@ -8,10 +8,17 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=20261015-16" />
+    <link rel="stylesheet" href="styles.css?v=20261015-19" />
     <style>
       /* Сцена страницы: конвейер, по которому едут ящики с поставкой */
-      .belt { position: absolute; left: -8%; right: -8%; bottom: 34px; height: 2px; background: rgba(255, 255, 255, 0.28); }
+      /* Края ленты растворяются — так же, как въезжают и уезжают ящики. Маска обрезает всё,
+         что вне блока, поэтому лента высотой 20px: линия сверху (на прежнем месте), штрихи ниже. */
+      .belt {
+        position: absolute; left: -8%; right: -8%; bottom: 16px; height: 20px;
+        background: linear-gradient(rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.28)) top / 100% 2px no-repeat;
+        -webkit-mask-image: linear-gradient(90deg, transparent, #000 25%, #000 75%, transparent);
+        mask-image: linear-gradient(90deg, transparent, #000 25%, #000 75%, transparent);
+      }
       .belt::before, .belt::after {
         content: ""; position: absolute; left: 0; right: 0; height: 2px;
         background: repeating-linear-gradient(to right, rgba(255, 255, 255, 0.55) 0 14px, transparent 14px 34px);
@@ -21,25 +28,43 @@
       .belt::after { top: 18px; opacity: 0.25; animation-duration: 1.6s; }
       @keyframes beltMove { to { background-position: 34px 0; } }
 
+      /* Ящик едет строго по горизонтали с постоянной скоростью: transform задан только в начале
+         и в конце пути, а opacity и blur — отдельно, на въезде и выезде. Анимируются только
+         transform, opacity и filter — без размытия фона под ящиком, чтобы не было рывков. */
       .crate {
         position: absolute; bottom: 36px; left: 0; width: var(--size, 44px); height: var(--size, 44px);
         border: 1.5px solid rgba(255, 255, 255, 0.75); border-radius: 6px;
-        background: rgba(10, 10, 11, 0.55); -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+        background: rgba(10, 10, 11, 0.75);
+        will-change: transform, opacity, filter;
         animation: crateRide var(--time, 9s) linear infinite; animation-delay: var(--delay, 0s);
       }
       /* Лента и крест-накрест, как на картонной коробке */
       .crate::before { content: ""; position: absolute; left: 0; right: 0; top: 34%; height: 1.5px; background: rgba(255, 255, 255, 0.5); }
       .crate::after { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1.5px; background: rgba(255, 255, 255, 0.3); }
-      .crate.is-new { background: #fff; border-color: #fff; animation: crateDrop 0.7s cubic-bezier(0.3, 1.4, 0.5, 1) both, crateRide 7s linear 0.7s 1 forwards; }
+      /* Новая поставка: белый ящик плавно опускается на ленту (без отскока и поворота),
+         затем едет от той же точки с той же скоростью, что и остальные, и растворяется в конце.
+         Езда без заполнения назад: пока ящик падает, его положение задаёт только crateDrop. */
+      .crate.is-new {
+        background: #fff; border-color: #fff;
+        animation: crateDrop 0.7s cubic-bezier(0.22, 1, 0.36, 1) both, crateRideNew var(--time, 7s) linear 0.7s 1 forwards;
+      }
       .crate.is-new::before, .crate.is-new::after { background: rgba(10, 10, 11, 0.35); }
       @keyframes crateRide {
-        from { transform: translateX(-80px) translateY(0); }
-        25% { transform: translateX(calc(var(--span) * 0.25)) translateY(-2px); }
-        50% { transform: translateX(calc(var(--span) * 0.5)) translateY(0); }
-        75% { transform: translateX(calc(var(--span) * 0.75)) translateY(-2px); }
-        to { transform: translateX(calc(var(--span) + 80px)) translateY(0); }
+        0% { transform: translate3d(-80px, 0, 0); opacity: 0; filter: blur(6px); }
+        12% { opacity: 1; filter: blur(0); }
+        88% { opacity: 1; filter: blur(0); }
+        100% { transform: translate3d(calc(var(--span) + 80px), 0, 0); opacity: 0; filter: blur(6px); }
       }
-      @keyframes crateDrop { from { opacity: 0; translate: 40px -140px; rotate: -18deg; } to { opacity: 1; translate: 40px 0; rotate: 0deg; } }
+      /* Белый ящик: падение — только по вертикали, на месте посадки (x = 40px) */
+      @keyframes crateDrop {
+        from { transform: translate3d(40px, -140px, 0); opacity: 0; filter: blur(6px); }
+        to { transform: translate3d(40px, 0, 0); opacity: 1; filter: blur(0); }
+      }
+      @keyframes crateRideNew {
+        0% { transform: translate3d(40px, 0, 0); }
+        88% { opacity: 1; filter: blur(0); }
+        100% { transform: translate3d(calc(var(--span) + 80px), 0, 0); opacity: 0; filter: blur(6px); }
+      }
 
       /* Новая строка формы выезжает, удаляемая — схлопывается */
       .supply-row.is-in { animation: rowIn 0.35s cubic-bezier(0.16, 1, 0.3, 1) both; }
@@ -48,7 +73,7 @@
       @keyframes rowOut { to { opacity: 0; transform: translateX(14px); } }
       tr.is-sub .item-list li { animation: rise 0.4s cubic-bezier(0.16, 1, 0.3, 1) both; animation-delay: calc(var(--i, 0) * 40ms); }
     </style>
-    <script src="motion.js?v=20261015-16"></script>
+    <script src="motion.js?v=20261015-19"></script>
   </head>
   <body>
     <div class="app" id="app">
@@ -126,8 +151,8 @@
       </main>
     </div>
 
-    <script src="api.js?v=20261015-16"></script>
-        <script src="shared.js?v=20261015-16"></script>
+    <script src="api.js?v=20261015-19"></script>
+        <script src="shared.js?v=20261015-19"></script>
     <script>
       ;(() => {
         if (!UI.shell('supplies')) return
@@ -202,8 +227,12 @@
           const crate = document.createElement('i')
           crate.className = 'crate is-new'
           crate.style.setProperty('--size', '50px')
+          // Скорость как у остальных ящиков (путь span + 160 px за 9 с), но путь короче: от 40 px.
+          const span = scene.clientWidth
+          const time = (9 * (span + 40)) / (span + 160)
+          crate.style.setProperty('--time', time.toFixed(2) + 's')
           scene.append(crate)
-          setTimeout(() => crate.remove(), 8000)
+          setTimeout(() => crate.remove(), (time + 0.8) * 1000)
         }
 
         /* ---------- Форма ---------- */
