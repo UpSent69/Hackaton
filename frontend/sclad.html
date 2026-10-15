@@ -274,12 +274,12 @@
     border-radius: 50%; flex-shrink: 0;
   }
 
-  .status-dot.ok::before { background: var(--text-secondary); }
+  .status-dot.ok::before { background: var(--stock-full); }
   .status-dot.warning::before { background: var(--stock-half); }
   .status-dot.danger::before { background: var(--stock-low); }
   .status-dot.critical::before { background: var(--stock-low); }
 
-  .status-dot.ok { color: var(--text-secondary); }
+  .status-dot.ok { color: var(--stock-full); }
   .status-dot.warning { color: var(--stock-half); }
   .status-dot.danger { color: var(--stock-low); }
   .status-dot.critical { color: var(--stock-low); }
@@ -319,6 +319,15 @@
 
   .batch-item:hover { background: rgba(255,255,255,0.03); }
   .batch-item .batch-name { color: var(--text-primary); font-weight: 500; min-width: 100px; }
+  .batch-item { align-items: center; }
+  .batch-writeoff {
+    margin-left: auto; padding: 4px 12px; border-radius: 6px; cursor: pointer;
+    font: inherit; font-size: 12px; color: var(--stock-low);
+    background: transparent; border: 1px solid rgba(248, 113, 113, 0.45);
+    transition: background 0.2s, color 0.2s;
+  }
+  .batch-writeoff:hover, .batch-writeoff.armed { background: var(--stock-low); color: #111; }
+  .batch-writeoff:disabled { opacity: 0.5; cursor: default; }
 
   /* Row entrance */
   .warehouse-table tbody tr {
@@ -346,7 +355,7 @@
   }
   .stock-bar.empty { background: rgba(255, 255, 255, 0.12); box-shadow: none; }
 </style>
-  <script src="motion.js?v=20261015-4"></script>
+  <script src="motion.js?v=20261015-5"></script>
 </head>
 <body>
 
@@ -356,6 +365,7 @@
     <ul class="nav-links">
       <li><a href="sclad.html" class="active">Склад</a></li>
       <li><a href="supplies.html">Поставки</a></li>
+      <li><a href="requests.html">Заявка</a></li>
       <li><a href="app.html#/menu">Меню</a></li>
       <li><a href="orders.html">Заказы</a></li>
       <li><a href="stoplist.html">Стоп-лист</a></li>
@@ -370,21 +380,21 @@
 
 <div class="warehouse-page">
   <h1 class="warehouse-title">Склад</h1>
-  <p class="warehouse-subtitle">Остатки по продуктам. Нажмите на строку, чтобы увидеть партии.</p>
+  <p class="warehouse-subtitle">Остатки по продуктам. Нажмите на строку, чтобы увидеть партии. Высота столбика — сколько осталось в партии, цвет — срок годности.</p>
 
   <!-- Легенда -->
   <div class="warehouse-legend">
     <div class="legend-item">
       <div class="legend-bar full"></div>
-      <span>Полон</span>
+      <span>В норме</span>
     </div>
     <div class="legend-item">
       <div class="legend-bar half"></div>
-      <span>Наполовину</span>
+      <span>Скоро истекает</span>
     </div>
     <div class="legend-item">
       <div class="legend-bar low"></div>
-      <span>Мало</span>
+      <span>Истекает / просрочено</span>
     </div>
   </div>
 
@@ -405,8 +415,8 @@
   </div>
 </div>
 
-<script src="api.js?v=20261015-4"></script>
-<script src="shared.js?v=20261015-4"></script>
+<script src="api.js?v=20261015-5"></script>
+<script src="shared.js?v=20261015-5"></script>
 <script>
 // ===== ДАННЫЕ С СЕРВЕРА =====
 // Список продуктов заполняется ответами API (см. loadServerData ниже).
@@ -478,6 +488,8 @@ function renderWarehouse() {
             <span class="batch-name">${batch.label}</span>
             <span>${batch.quantity}</span>
             <span>${batch.deadline}</span>
+            <span class="status-dot ${batch.status}">${batch.statusText}</span>
+            ${batch.canWriteOff ? `<button type="button" class="batch-writeoff" data-writeoff="${batch.id}">Списать</button>` : ''}
           </div>
         `;
       });
@@ -515,11 +527,14 @@ function toggleRow(idx) {
 
 // ===== ЗАГРУЗКА ДАННЫХ С СЕРВЕРА =====
 const STATUS_CLASS = { ok: 'ok', warning: 'warning', critical: 'critical', expired: 'danger' };
+// Цвет столбика партии совпадает с цветом её статуса в колонке «Статус».
+const BAR_LEVEL = { ok: 'full', warning: 'half', critical: 'low', expired: 'low' };
 
 async function loadServerData() {
   let stock, batches;
   try {
-    [stock, batches] = await Promise.all([API.get('/stock'), API.get('/expiry')]);
+    // /demo/state сверяет часы с сервером, чтобы «через N ч» учитывало перемотку времени в демо.
+    [stock, batches] = await Promise.all([API.get('/stock'), API.get('/expiry'), API.get('/demo/state').catch(() => null)]);
   } catch (error) {
     const body = document.getElementById('warehouseBody');
     if (body) body.innerHTML = '<tr><td colspan="6" style="padding:48px 12px;text-align:center;color:var(--text-muted)">' +
@@ -527,6 +542,8 @@ async function loadServerData() {
     return;
   }
 
+  const user = API.getUser();
+  const isAdmin = Boolean(user && user.role === 'admin');
   serverData.products = stock.map((item) => {
     // Партии продукта с остатком, ближайшие по сроку — первыми.
     const own = batches.filter((batch) => batch.productId === item.productId && batch.qtyRemaining > 0);
@@ -539,15 +556,21 @@ async function loadServerData() {
       deadline: item.nearestExpiresAt ? UI.formatTimeLeft(item.nearestExpiresAt) : '',
       status: STATUS_CLASS[item.status] || 'ok',
       statusText: UI.STATUS[item.status] ? UI.STATUS[item.status].label : '',
-      // Три столбика — остаток в трёх ближайших по сроку партиях, в процентах от принятого.
+      // Три столбика — остаток в трёх ближайших по сроку партиях: высота — процент от принятого,
+      // цвет — статус срока партии.
       stock: own.slice(0, 3).map((batch) => {
         const percent = Math.round((batch.qtyRemaining / batch.qtyInitial) * 100);
-        return { percent, level: percent > 66 ? 'full' : percent > 33 ? 'half' : 'low' };
+        return { percent, level: BAR_LEVEL[batch.status] || 'full' };
       }),
       batchList: own.map((batch) => ({
         label: 'Поставка ' + UI.escapeHtml(batch.supplyNumber),
         quantity: UI.formatQuantity(batch.qtyRemaining, item.unit) + ' из ' + UI.formatQuantity(batch.qtyInitial, item.unit),
         deadline: UI.formatTimeLeft(batch.expiresAt),
+        id: UI.escapeHtml(batch.id),
+        status: STATUS_CLASS[batch.status] || 'ok',
+        statusText: UI.STATUS[batch.status] ? UI.STATUS[batch.status].label : '',
+        // Просрочку списывает только администратор, вручную.
+        canWriteOff: batch.status === 'expired' && isAdmin,
       })),
     };
   });
@@ -576,6 +599,28 @@ function renderNavActions() {
     (user && user.role === 'admin' ? '<a class="nav-dashboard-btn" href="app.html#/admin">Администрирование</a>' : '') +
     (user ? '<button type="button" class="nav-dashboard-btn" data-logout>Выйти</button>' : '<a class="nav-dashboard-btn" href="login.html">Войти</a>');
 }
+
+// «Списать» у просроченной партии: первый клик просит подтверждения, второй списывает.
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-writeoff]');
+  if (!button || button.disabled) return;
+  if (!button.classList.contains('armed')) {
+    button.classList.add('armed');
+    button.textContent = 'Точно списать?';
+    setTimeout(() => { button.classList.remove('armed'); button.textContent = 'Списать'; }, 4000);
+    return;
+  }
+  button.disabled = true;
+  try {
+    await API.post('/batches/' + encodeURIComponent(button.dataset.writeoff) + '/writeoff');
+    const openId = serverData.products[Number(button.closest('tr').id.replace('expanded-', ''))]?.id;
+    if (openId) history.replaceState(null, '', '?open=' + encodeURIComponent(openId));
+    await loadServerData();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = error.message || 'Не удалось списать';
+  }
+});
 
 document.addEventListener('DOMContentLoaded', () => {
   renderWarehouse();

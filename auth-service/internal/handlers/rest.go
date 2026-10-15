@@ -68,6 +68,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("GET", "/api/stock", false, a.cachedJSON("stock", a.Stock))
 	authed("GET", "/api/stock/{productId}/batches", false, a.Batches)
 	authed("GET", "/api/expiry", false, a.Expiry)
+	authed("POST", "/api/batches/{id}/writeoff", true, a.WriteOffBatch)
 	authed("GET", "/api/supplies", false, a.Supplies)
 	authed("POST", "/api/supplies", true, a.CreateSupply)
 	mux.Handle("POST /api/supplies/parse", a.protectLongRunning(true, a.rateLimited("parse", 10, time.Minute, true, a.ParseSupplyFile)))

@@ -102,19 +102,9 @@ func (a *API) maintain() error {
 	}
 	changed := false
 	for _, batch := range batches {
+		// Просроченный остаток не списывается автоматически: он остаётся на складе
+		// (в заказах и остатках не участвует), пока администратор не спишет его вручную.
 		status := batchStatus(batch.ReceivedAt, batch.ExpiresAt, now)
-		if !now.Before(batch.ExpiresAt) && batch.QtyRemaining > 0 {
-			_, err := a.DB.Exec(
-				"UPDATE batches SET qty_remaining=0,written_off=written_off+?,last_status=? WHERE id=?",
-				batch.QtyRemaining, string(contract.StatusExpired), batch.ID,
-			)
-			if err != nil {
-				return err
-			}
-			a.addAlert(contract.AlertLevel("expired"), fmt.Sprintf("Срок продукта «%s» из поставки %s истёк: остаток списан.", batch.ProductName, batch.SupplyNumber), now)
-			changed = true
-			continue
-		}
 		if batch.LastStatus != string(status) {
 			_, err := a.DB.Exec("UPDATE batches SET last_status=? WHERE id=?", string(status), batch.ID)
 			if err != nil {
@@ -126,6 +116,10 @@ func (a *API) maintain() error {
 					a.addAlert(contract.AlertLevel("warning"), fmt.Sprintf("У продукта «%s» из поставки %s скоро истекает срок.", batch.ProductName, batch.SupplyNumber), now)
 				case contract.StatusCritical:
 					a.addAlert(contract.AlertLevel("critical"), fmt.Sprintf("У продукта «%s» из поставки %s критически близкий срок годности.", batch.ProductName, batch.SupplyNumber), now)
+				case contract.StatusExpired:
+					if batch.QtyRemaining > 0 {
+						a.addAlert(contract.AlertLevel("expired"), fmt.Sprintf("Срок продукта «%s» из поставки %s истёк: спишите остаток на складе.", batch.ProductName, batch.SupplyNumber), now)
+					}
 				}
 			}
 			changed = true
@@ -297,8 +291,9 @@ func (a *API) Stock(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, batch := range batches {
 			item.BatchCount++
+			// Статус продукта — худший среди партий, которые ещё лежат на складе.
 			status := batchStatus(batch.ReceivedAt, batch.ExpiresAt, now)
-			if statusRank(status) > statusRank(item.Status) {
+			if batch.QtyRemaining > 0 && statusRank(status) > statusRank(item.Status) {
 				item.Status = status
 			}
 			if now.Before(batch.ExpiresAt) && batch.QtyRemaining > 0 {
@@ -657,4 +652,44 @@ func _unusedWarehouseImports() {
 	_ = sortBatchRows
 	_ = strconv.IntSize
 	_ = strings.TrimSpace
+}
+
+// WriteOffBatch вручную списывает остаток просроченной партии.
+func (a *API) WriteOffBatch(w http.ResponseWriter, r *http.Request) {
+	batchID, err := parseID(r.PathValue("id"))
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор партии")
+		return
+	}
+	rows, err := a.loadBatchRows("WHERE b.id=?", batchID)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось найти партию")
+		return
+	}
+	if len(rows) == 0 {
+		a.writeError(w, http.StatusNotFound, "Партия не найдена")
+		return
+	}
+	batch := rows[0]
+	now, _ := a.nowAndSpeed()
+	if now.Before(batch.ExpiresAt) {
+		a.writeError(w, http.StatusConflict, "Списать можно только просроченную партию")
+		return
+	}
+	if batch.QtyRemaining <= 0 {
+		a.writeError(w, http.StatusConflict, "Партия уже списана")
+		return
+	}
+	if _, err := a.DB.Exec(
+		"UPDATE batches SET qty_remaining=0,written_off=written_off+?,last_status=? WHERE id=?",
+		batch.QtyRemaining, string(contract.StatusExpired), batch.ID,
+	); err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось списать партию")
+		return
+	}
+	a.addAlert(contract.AlertLevel("expired"), fmt.Sprintf("Просроченный остаток продукта «%s» из поставки %s списан вручную.", batch.ProductName, batch.SupplyNumber), now)
+	a.bumpRev()
+	a.sendJSON(w, http.StatusOK, map[string]any{
+		"id": strconv.FormatInt(batch.ID, 10), "writtenOff": batch.QtyRemaining, "qtyRemaining": 0,
+	})
 }

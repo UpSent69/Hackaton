@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=20261015-4" />
+    <link rel="stylesheet" href="styles.css?v=20261015-5" />
     <style>
       /* Сцена страницы: радар. Каждое блюдо — точка: в стопе — ближе к центру и мигает */
       .radar { position: absolute; top: 50%; left: 50%; width: 220px; height: 220px; transform: translate(-50%, -50%); border-radius: 50%; }
@@ -60,7 +60,7 @@
       .all-clear path { fill: none; stroke: #fff; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 30; stroke-dashoffset: 30; animation: draw 0.7s 0.3s ease forwards; }
       @keyframes draw { to { stroke-dashoffset: 0; } }
     </style>
-    <script src="motion.js?v=20261015-4"></script>
+    <script src="motion.js?v=20261015-5"></script>
   </head>
   <body>
     <div class="app" id="app">
@@ -91,8 +91,8 @@
       </main>
     </div>
 
-    <script src="api.js?v=20261015-4"></script>
-        <script src="shared.js?v=20261015-4"></script>
+    <script src="api.js?v=20261015-5"></script>
+        <script src="shared.js?v=20261015-5"></script>
     <script>
       ;(() => {
         if (!UI.shell('stoplist')) return
