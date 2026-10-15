@@ -34,15 +34,63 @@ type analyticsInsightResponse struct {
 // Сам анализ идёт в фоне: после перерыва Ollama сначала загружает модель в память, и ответ
 // может прийти позже, чем nginx держит запрос (60 с). Поэтому маршрут сразу отвечает 202
 // «считается», а страница переспрашивает с ?poll=1, пока не получит результат.
+//
+// Результат, признак «считается» и последняя ошибка хранятся в Redis (переживают перезапуск
+// сервера, признак «считается» снимается сам через insightTimeout); без Redis — в памяти.
 var (
 	insightMu      sync.Mutex
 	insightRev     int64 = -1
 	insightCache   analyticsInsightResponse
 	insightRunning bool
-	insightErr     string // ошибка последнего фонового анализа; сбрасывается при новом запуске
+	insightErr     string
 )
 
 const insightTimeout = 3 * time.Minute
+
+type storedInsight struct {
+	Rev    int64                    `json:"rev"`
+	Result analyticsInsightResponse `json:"result"`
+}
+
+func (a *API) loadInsight() (analyticsInsightResponse, int64, bool) {
+	if raw, ok := a.KV.Get("insight:result"); ok {
+		var stored storedInsight
+		if json.Unmarshal([]byte(raw), &stored) == nil {
+			return stored.Result, stored.Rev, true
+		}
+	}
+	return insightCache, insightRev, insightRev >= 0
+}
+
+func (a *API) saveInsight(rev int64, result analyticsInsightResponse) {
+	insightCache, insightRev = result, rev
+	if encoded, err := json.Marshal(storedInsight{Rev: rev, Result: result}); err == nil {
+		a.KV.Set("insight:result", string(encoded), 24*time.Hour)
+	}
+}
+
+func (a *API) insightIsRunning() bool {
+	if _, ok := a.KV.Get("insight:running"); ok {
+		return true
+	}
+	return insightRunning
+}
+
+func (a *API) insightError() string {
+	if message, ok := a.KV.Get("insight:error"); ok {
+		return message
+	}
+	return insightErr
+}
+
+func (a *API) setInsightError(message string) {
+	insightErr = message
+	if message == "" {
+		a.KV.Del("insight:error")
+	} else {
+		a.KV.Set("insight:error", message, 10*time.Minute)
+	}
+}
 
 // AnalyticsInsight передаёт локальной Qwen ту же статистику, что показывает вкладка «Аналитика».
 // Без параметров — свежий анализ из памяти или запуск нового; ?refresh=1 — пересчитать
@@ -51,15 +99,16 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 	insightMu.Lock()
 	defer insightMu.Unlock()
 	pending := map[string]string{"status": "pending"}
+	cached, cachedRev, hasCached := a.loadInsight()
 
 	if r.URL.Query().Get("poll") == "1" {
-		switch {
-		case insightRunning:
+		switch message := a.insightError(); {
+		case a.insightIsRunning():
 			a.sendJSON(w, http.StatusAccepted, pending)
-		case insightErr != "":
-			a.writeError(w, http.StatusInternalServerError, insightErr)
-		case insightRev >= 0:
-			a.sendJSON(w, http.StatusOK, insightCache)
+		case message != "":
+			a.writeError(w, http.StatusInternalServerError, message)
+		case hasCached:
+			a.sendJSON(w, http.StatusOK, cached)
 		default:
 			a.writeError(w, http.StatusConflict, "Анализ не запущен — нажмите «Обновить анализ»")
 		}
@@ -69,17 +118,26 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 	refresh := r.URL.Query().Get("refresh") == "1"
 	requestMu.Lock()
 	rev := a.currentRev()
-	if !refresh && rev == insightRev {
+	if !refresh && hasCached && rev == cachedRev {
 		requestMu.Unlock()
-		cached := insightCache
 		cached.Cached = true
 		a.sendJSON(w, http.StatusOK, cached)
 		return
 	}
-	if insightRunning {
+	if a.insightIsRunning() {
 		requestMu.Unlock()
 		a.sendJSON(w, http.StatusAccepted, pending)
 		return
+	}
+	// Пересчёт по кнопке ограничен: каждый запуск занимает Qwen на десятки секунд.
+	if refresh {
+		if auth := currentAuth(r); auth != nil {
+			if ok, wait := a.allow("insight:user:"+auth.User.ID, 6, time.Minute); !ok {
+				requestMu.Unlock()
+				a.writeError(w, http.StatusTooManyRequests, fmt.Sprintf("Анализ обновляли слишком часто. Попробуйте через %d с.", int(wait.Seconds())+1))
+				return
+			}
+		}
 	}
 	facts, hasData, menuNames, err := a.analyticsFacts(r)
 	now, _ := a.nowAndSpeed()
@@ -93,8 +151,13 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Замок в Redis не даёт запустить два анализа одновременно, даже из разных процессов.
+	if acquired, ok := a.KV.SetNX("insight:running", "1", insightTimeout+30*time.Second); ok && !acquired {
+		a.sendJSON(w, http.StatusAccepted, pending)
+		return
+	}
 	insightRunning = true
-	insightErr = ""
+	a.setInsightError("")
 	go a.generateInsight(rev, facts, menuNames, now)
 	a.sendJSON(w, http.StatusAccepted, pending)
 }
@@ -109,19 +172,21 @@ func (a *API) generateInsight(rev int64, facts string, menuNames []string, now t
 
 	insightMu.Lock()
 	defer insightMu.Unlock()
-	insightRunning = false
+	defer func() {
+		insightRunning = false
+		a.KV.Del("insight:running")
+	}()
 	if err != nil {
-		insightErr = friendlyOllamaError(err, model)
+		a.setInsightError(friendlyOllamaError(err, model))
 		return
 	}
 	menuPicks := onlyMenuDishes(insight.MenuPicks, menuNames)
 	log.Printf("Аналитика Qwen: блюд из меню предложено %d, совпало с меню %d", len(insight.MenuPicks), len(menuPicks))
-	insightCache = analyticsInsightResponse{
+	a.saveInsight(rev, analyticsInsightResponse{
 		Summary: insight.Summary, Risks: insight.Risks, Actions: insight.Actions,
 		Season: insight.Season, MenuPicks: menuPicks, NewDishes: insight.NewDishes,
 		Model: model, GeneratedAt: now,
-	}
-	insightRev = rev
+	})
 }
 
 // friendlyOllamaError объясняет частые причины на компьютере, где Ollama настроена иначе.

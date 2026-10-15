@@ -52,3 +52,27 @@ func TestInsightListsAcceptObjects(t *testing.T) {
 		t.Fatalf("unexpected menu picks: %#v", insight.MenuPicks)
 	}
 }
+
+func TestMatchByRulesUsesMeaning(t *testing.T) {
+	catalog := []string{"Куриное филе", "Мука", "Огурцы", "Рис", "Сливки", "Сыр", "Томаты", "Яйца", "Масло сливочное"}
+	cases := map[string]string{
+		"Помидоры свежие": "Томаты",
+		"Огурцы свежие":   "Огурцы",
+		"Куриная грудка":  "Куриное филе",
+		"Сыр твёрдый":     "Сыр",
+		"Яйца куриные":    "Яйца",
+		"Рис":             "Рис",
+		"Сливки 33 %":     "Сливки",
+	}
+	for name, want := range cases {
+		index, ok := MatchByRules(name, catalog)
+		if !ok || catalog[index] != want {
+			t.Errorf("%q: got %v %v, want %q", name, index, ok, want)
+		}
+	}
+	for _, name := range []string{"Бананы", "Молоко 2,5%", "Макароны", "Хлеб", "Подсолнечное масло"} {
+		if index, ok := MatchByRules(name, catalog); ok {
+			t.Errorf("%q must not match, got %q", name, catalog[index])
+		}
+	}
+}

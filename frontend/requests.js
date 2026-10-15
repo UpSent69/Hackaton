@@ -1,4 +1,5 @@
-/* AI-assisted customer request editor. The server owns product matching, prices and final totals. */
+/* Заявка заказчика на банкет: блюда меню и число порций. Сервер распознаёт документ,
+   сопоставляет блюда с меню, берёт цены порций из БД и считает итог. */
 ;(() => {
   if (!UI.shell('requests')) return
 
@@ -18,6 +19,7 @@
   const sourceFilename = el('sourceFilename')
   const sourceHashShort = el('sourceHashShort')
   const rowsNode = el('requestItems')
+  const stockNode = el('requestStock')
   const globalDiscountNode = el('globalDiscount')
   const saveButton = el('saveRequest')
   const saveMessage = el('saveMessage')
@@ -25,10 +27,8 @@
   const historyNode = el('requestHistory')
   const admin = UI.isAdmin()
 
-  const units = { g: 'г', kg: 'кг', ml: 'мл', l: 'л', pcs: 'шт' }
   const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', maximumFractionDigits: 2 })
-  const number = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 3 })
-  let catalog = []
+  let menu = []
   let items = []
   let globalDiscount = 0
   let currentSourceFilename = ''
@@ -48,10 +48,6 @@
     return (Number(kopecks || 0) / 100).toFixed(2)
   }
 
-  function asMoneyInput(kopecks, configured) {
-    return configured ? rawMoney(kopecks) : ''
-  }
-
   function manualPriceKopecks(value) {
     if (value === null || value === undefined || String(value).trim() === '') return null
     const parsed = Number(String(value).replace(',', '.'))
@@ -59,13 +55,13 @@
     return Math.round(parsed * 100)
   }
 
-  function productByID(id) {
-    return catalog.find((product) => String(product.id) === String(id)) || null
+  function dishByID(id) {
+    return menu.find((dish) => String(dish.dishId) === String(id)) || null
   }
 
-  function quantityValue(value) {
-    const parsed = Number(String(value ?? '').replace(',', '.'))
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+  function portionsValue(value) {
+    const parsed = Math.round(Number(String(value ?? '').replace(',', '.')))
+    return Number.isFinite(parsed) && parsed > 0 && parsed <= 100000 ? parsed : 0
   }
 
   function discountValue(value) {
@@ -73,26 +69,17 @@
     return Number.isFinite(parsed) ? Math.max(0, Math.min(100, Math.round(parsed))) : 0
   }
 
-  function convertQuantity(quantity, from, to) {
-    if (!from || !to || from === to) return quantity
-    if (from === 'kg' && to === 'g') return quantity * 1000
-    if (from === 'g' && to === 'kg') return quantity / 1000
-    if (from === 'l' && to === 'ml') return quantity * 1000
-    if (from === 'ml' && to === 'l') return quantity / 1000
-    return null
-  }
-
-  function setProductCatalog(newCatalog) {
-    catalog = Array.isArray(newCatalog) ? newCatalog : []
+  function setMenu(newMenu) {
+    menu = Array.isArray(newMenu) ? newMenu : []
     renderPrices()
     if (items.length) renderRows()
   }
 
-  async function loadCatalog() {
+  async function loadMenu() {
     try {
-      setProductCatalog(await API.get('/products'))
+      setMenu(await API.get('/menu'))
     } catch (error) {
-      catalogNode.innerHTML = '<tr><td colspan="4" class="request-error">Не удалось загрузить товары: ' + UI.escapeHtml(error.message) + '</td></tr>'
+      catalogNode.innerHTML = '<tr><td colspan="3" class="request-error">Не удалось загрузить меню: ' + UI.escapeHtml(error.message) + '</td></tr>'
     }
   }
 
@@ -154,7 +141,7 @@
     renderWarnings([])
     editor.hidden = false
     renderRows()
-    message(uploadMessage, 'Пустой черновик создан. Добавь позиции и выбери товары из каталога.', false)
+    message(uploadMessage, 'Пустой черновик создан. Добавь блюда из меню и число порций.', false)
     editor.scrollIntoView({ behavior: 'smooth', block: 'start' })
   })
 
@@ -171,10 +158,10 @@
     }
     analyzeButton.disabled = true
     analyzeButton.textContent = 'Анализируем…'
-    message(uploadMessage, 'Извлекаем текст и сопоставляем товары с каталогом…', false)
+    message(uploadMessage, 'Распознаём заявку и ищем блюда в меню…', false)
     renderWarnings([])
     try {
-      const result = await API.upload('/requests/parse', file)
+      const result = await API.upload('/requests/parse', file).then(API.awaitJob)
       currentSourceFilename = result.sourceFilename || file.name
       currentSourceHash = result.sourceHash || ''
       aiUsed = Boolean(result.aiUsed)
@@ -182,21 +169,14 @@
       customerName.value = result.customerName || ''
       sourceFilename.textContent = currentSourceFilename
       sourceHashShort.textContent = currentSourceHash ? 'SHA-256 · ' + currentSourceHash.slice(0, 16) + '…' : ''
-      if (Array.isArray(result.catalog)) setProductCatalog(result.catalog)
+      if (Array.isArray(result.catalog)) setMenu(result.catalog)
       items = (Array.isArray(result.items) ? result.items : []).map((item) => ({
-        originalName: item.originalName || item.productName || '',
-        productName: item.productName || item.originalName || '',
-        productId: item.productId || '',
-        quantity: item.quantity || '',
-        unit: item.unit || '',
-        unitPriceKopecks: item.unitPriceKopecks || 0,
-        priceConfigured: Boolean(item.priceConfigured),
-        available: Number(item.available || 0),
+        originalName: item.originalName || item.dishName || '',
+        dishId: item.dishId || '',
+        portions: item.portions || 1,
         catalogMatch: Boolean(item.catalogMatch),
-        unitMismatch: Boolean(item.unitMismatch),
         manualPrice: '',
         itemDiscountPercent: Number(item.itemDiscountPercent || 0),
-        confidence: Number(item.confidence || 0),
       }))
       globalDiscount = 0
       globalDiscountNode.value = '0'
@@ -204,23 +184,18 @@
       renderRows()
       const parserMode = result.parserMode || (aiUsed ? 'ai' : 'fallback')
       updateAIStatus(
+        parserMode === 'ai' ? 'Нейросеть обработала заявку' : parserMode === 'structured' ? 'Список распознан по строкам' : 'Включён упрощённый разбор',
         parserMode === 'ai'
-          ? 'Нейросеть обработала документ'
+          ? 'Qwen выделила ' + items.length + ' поз. Проверь блюда и число порций.'
           : parserMode === 'structured'
-            ? 'Список распознан по строкам'
-            : 'Включён упрощённый разбор',
-        parserMode === 'ai'
-          ? 'Qwen выделила ' + items.length + ' поз. Проверь соответствие товарам и единицы измерения.'
-          : parserMode === 'structured'
-            ? 'Простой текстовый список разобран без ожидания ответа модели. Проверь названия и количество.'
-            : 'Ollama не ответила или не выделила позиции. Использован упрощённый разбор; проверь распознавание.',
+            ? 'Простой список разобран без ожидания модели. Проверь блюда и число порций.'
+            : 'Ollama не ответила или не выделила блюда. Использован упрощённый разбор; проверь распознавание.',
         parserMode === 'fallback'
       )
       const warnings = [...(result.warnings || [])]
       if (duplicateSaved) warnings.unshift('Этот файл уже встречался в сохранённых заявках. Повторное сохранение будет заблокировано.')
       renderWarnings(warnings)
-      message(uploadMessage, items.length ? 'Черновик готов к проверке.' : 'Файл прочитан. Добавь товарные позиции вручную.', false)
-      updateTotals()
+      message(uploadMessage, items.length ? 'Черновик готов к проверке.' : 'Файл прочитан. Добавь блюда вручную.', false)
       editor.scrollIntoView({ behavior: 'smooth', block: 'start' })
     } catch (error) {
       message(uploadMessage, error.message || 'Не удалось обработать файл.', true)
@@ -232,50 +207,39 @@
 
   function renderRows() {
     if (!items.length) {
-      rowsNode.innerHTML = '<tr><td colspan="6" class="request-empty">Пока нет позиций. Нажми «Добавить позицию» и выбери товар из каталога.</td></tr>'
+      rowsNode.innerHTML = '<tr><td colspan="6" class="request-empty">Пока нет позиций. Нажми «Добавить блюдо» и выбери блюдо из меню.</td></tr>'
       updateTotals()
       return
     }
     rowsNode.innerHTML = items.map((item, index) => {
-      const product = productByID(item.productId)
-      const optionList = ['<option value="">Выбери товар…</option>'].concat(catalog.map((option) =>
-        '<option value="' + UI.escapeHtml(option.id) + '"' + (String(option.id) === String(item.productId) ? ' selected' : '') + '>' + UI.escapeHtml(option.name) + '</option>'
+      const dish = dishByID(item.dishId)
+      const optionList = ['<option value="">Выбери блюдо…</option>'].concat(menu.map((option) =>
+        '<option value="' + UI.escapeHtml(option.dishId) + '"' + (String(option.dishId) === String(item.dishId) ? ' selected' : '') + '>' + UI.escapeHtml(option.name) + '</option>'
       )).join('')
 
-      let priceText = '<span class="request-not-set">Сначала выбери товар из каталога</span>'
-      if (product && product.priceConfigured) {
-        priceText = '<span class="request-price" data-unit-price="' + index + '">' + rubles(product.basePriceKopecks) + '</span><span class="request-unit-price-note">за 1 ' + UI.escapeHtml(units[product.unit] || product.unit) + ' · из БД</span>'
-      } else if (product) {
-        priceText = '<div class="request-manual-price"><input class="input" data-item-price="' + index + '" type="number" min="0" max="10000000000" step="0.01" inputmode="decimal" value="' + UI.escapeHtml(item.manualPrice || '') + '" placeholder="Ввести цену" aria-label="Ручная цена позиции ' + (index + 1) + '" /><span>₽</span></div><span class="request-unit-price-note request-not-set">Цена не задана в БД; цена только для этой заявки</span>'
+      let priceText = '<span class="request-not-set">Сначала выбери блюдо</span>'
+      if (dish && dish.priceConfigured) {
+        priceText = '<span class="request-price">' + rubles(dish.priceKopecks) + '</span><span class="request-unit-price-note">за порцию · из меню</span>'
+      } else if (dish) {
+        priceText = '<div class="request-manual-price"><input class="input" data-item-price="' + index + '" type="number" min="0" max="10000000000" step="0.01" inputmode="decimal" value="' + UI.escapeHtml(item.manualPrice || '') + '" placeholder="Цена порции" aria-label="Цена порции, позиция ' + (index + 1) + '" /><span>₽</span></div><span class="request-unit-price-note request-not-set">Цена порции не задана в меню — только для этой заявки</span>'
       }
 
       const notes = []
-      if (!product && item.unitMismatch) {
-        notes.push('Товар найден в каталоге, но единица измерения не совпадает. Проверь товар и количество.')
-      } else if (!product && item.originalName && !item.catalogMatch) {
-        notes.push('Товара «' + item.originalName + '» нет в каталоге и на складе. Добавь его через «Поставки» или выбери замену.')
-      } else if (!product) {
-        notes.push('Выбери товар из каталога.')
+      if (!dish && item.originalName && !item.catalogMatch) {
+        notes.push('Блюда «' + item.originalName + '» нет в меню. Выбери замену или удали строку.')
+      } else if (!dish) {
+        notes.push('Выбери блюдо из меню.')
       } else {
-        if (item.originalName && item.originalName.toLowerCase() !== product.name.toLowerCase()) {
-          notes.push('В документе: ' + item.originalName)
-        }
-        if (product.available !== undefined && product.available !== null) {
-          if (Number(product.available) <= 0) {
-            notes.push('Товар найден в каталоге, но на складе нет доступного остатка.')
-          } else {
-            notes.push('На складе: ' + number.format(Number(product.available)) + ' ' + (units[product.unit] || product.unit))
-          }
-        }
+        if (item.originalName && item.originalName.toLowerCase() !== dish.name.toLowerCase()) notes.push('В заявке: ' + item.originalName)
+        notes.push(dish.stopped ? 'Сейчас в стоп-листе — продуктов не хватает даже на одну порцию.' : 'Из остатков можно приготовить сейчас: ' + UI.portionsLabel(dish.availablePortions))
       }
       const sourceNote = notes.map((note) => '<span class="request-original-name">' + UI.escapeHtml(note) + '</span>').join('')
-      const quantityUnit = product ? product.unit : (item.unit || '')
       return '<tr data-request-row="' + index + '">' +
-        '<td class="request-product-cell"><select class="input" data-product-select="' + index + '" aria-label="Товар позиции ' + (index + 1) + '">' + optionList + '</select>' + sourceNote + '</td>' +
-        '<td><input class="input" data-quantity="' + index + '" type="number" min="0.001" step="0.001" inputmode="decimal" value="' + UI.escapeHtml(item.quantity) + '" aria-label="Количество позиции ' + (index + 1) + '" /><span class="request-unit-price-note">' + UI.escapeHtml(units[quantityUnit] || quantityUnit || 'ед.') + '</span></td>' +
+        '<td class="request-product-cell"><select class="input" data-dish-select="' + index + '" aria-label="Блюдо позиции ' + (index + 1) + '">' + optionList + '</select>' + sourceNote + '</td>' +
+        '<td><input class="input" data-portions="' + index + '" type="number" min="1" max="100000" step="1" inputmode="numeric" value="' + UI.escapeHtml(item.portions) + '" aria-label="Порций, позиция ' + (index + 1) + '" /><span class="request-unit-price-note">порц.</span></td>' +
         '<td>' + priceText + '</td>' +
         '<td><div class="request-discount-input"><input class="input" data-item-discount="' + index + '" type="number" min="0" max="100" step="1" value="' + discountValue(item.itemDiscountPercent) + '" aria-label="Скидка позиции в процентах" /><span>%</span></div></td>' +
-        '<td class="request-line-total" data-row-total="' + index + '">' + (product && product.priceConfigured ? rubles(0) : '—') + '</td>' +
+        '<td class="request-line-total" data-row-total="' + index + '">—</td>' +
         '<td><button type="button" class="request-remove" data-remove-item="' + index + '" aria-label="Удалить позицию">×</button></td>' +
         '</tr>'
     }).join('')
@@ -285,43 +249,32 @@
   function updateTotals() {
     let subtotal = 0
     let total = 0
-    let missingMapping = false
+    let missingDish = false
     let missingPrice = false
-    let invalidQuantity = false
-    let invalidUnit = false
+    let invalidPortions = false
 
     items.forEach((item, index) => {
-      const product = productByID(item.productId)
-      const quantity = quantityValue(item.quantity)
-      const lineDiscount = discountValue(item.itemDiscountPercent)
+      const dish = dishByID(item.dishId)
+      const portions = portionsValue(item.portions)
       const cell = rowsNode.querySelector('[data-row-total="' + index + '"]')
-      if (!product) {
-        missingMapping = true
-        if (cell) cell.textContent = item.unitMismatch ? 'Проверь единицы' : (item.originalName ? 'Нет в каталоге' : 'Выбери товар')
+      if (!dish) {
+        missingDish = true
+        if (cell) cell.textContent = item.originalName ? 'Нет в меню' : 'Выбери блюдо'
         return
       }
-      if (item.unitMismatch) {
-        invalidUnit = true
-        if (cell) cell.textContent = 'Проверь единицы'
+      if (!portions) {
+        invalidPortions = true
+        if (cell) cell.textContent = 'Укажи порции'
         return
       }
-      if (!quantity) {
-        invalidQuantity = true
-        if (cell) cell.textContent = 'Укажи количество'
-        return
-      }
-
-      const unitPriceKopecks = product.priceConfigured
-        ? Number(product.basePriceKopecks || 0)
-        : manualPriceKopecks(item.manualPrice)
+      const unitPriceKopecks = dish.priceConfigured ? Number(dish.priceKopecks || 0) : manualPriceKopecks(item.manualPrice)
       if (unitPriceKopecks === null) {
         missingPrice = true
         if (cell) cell.textContent = 'Введи цену'
         return
       }
-
-      const lineSubtotal = Math.round(unitPriceKopecks * quantity)
-      const lineTotal = Math.round(lineSubtotal * (1 - lineDiscount / 100) * (1 - globalDiscount / 100))
+      const lineSubtotal = unitPriceKopecks * portions
+      const lineTotal = Math.round(lineSubtotal * (1 - discountValue(item.itemDiscountPercent) / 100) * (1 - globalDiscount / 100))
       subtotal += lineSubtotal
       total += lineTotal
       if (cell) cell.textContent = rubles(lineTotal)
@@ -331,78 +284,79 @@
     el('summaryDiscount').textContent = '−' + rubles(Math.max(0, subtotal - total))
     el('summaryTotal').textContent = rubles(total)
 
-    const canSave = admin && items.length > 0 && !missingMapping && !missingPrice && !invalidQuantity && !invalidUnit && !duplicateSaved
+    const canSave = admin && items.length > 0 && !missingDish && !missingPrice && !invalidPortions && !duplicateSaved
     saveButton.disabled = !canSave
-    if (!admin) {
-      message(saveMessage, 'Сохранять заявки и менять цены может только администратор.', true)
-    } else if (duplicateSaved) {
-      message(saveMessage, 'Этот исходный файл уже сохранён. Загрузи другой файл или создай заявку вручную.', true)
-    } else if (missingMapping) {
-      message(saveMessage, 'Для каждой позиции нужен товар из БД. Если его нет на складе, добавь его через «Поставки» или выбери замену.', true)
-    } else if (missingPrice) {
-      message(saveMessage, 'Для строки без цены в БД введи цену вручную. Она сохранится только в этой заявке.', true)
-    } else if (invalidUnit) {
-      message(saveMessage, 'Проверь единицы измерения: автоматический пересчёт невозможен.', true)
-    } else if (invalidQuantity) {
-      message(saveMessage, 'Укажи положительное количество для каждой позиции.', true)
-    } else {
-      message(saveMessage, '', false)
+    if (!admin) message(saveMessage, 'Сохранять заявки и менять цены может только администратор.', true)
+    else if (duplicateSaved) message(saveMessage, 'Этот исходный файл уже сохранён. Загрузи другой файл или создай заявку вручную.', true)
+    else if (missingDish) message(saveMessage, 'Для каждой позиции выбери блюдо из меню. Если его нет — добавь блюдо во вкладке «Меню» или удали строку.', true)
+    else if (missingPrice) message(saveMessage, 'Для блюда без цены порции введи цену вручную. Она сохранится только в этой заявке.', true)
+    else if (invalidPortions) message(saveMessage, 'Укажи число порций от 1 до 100 000 для каждой позиции.', true)
+    else message(saveMessage, '', false)
+    scheduleStockCheck()
+  }
+
+  /* ---------- Хватит ли продуктов на все порции ---------- */
+
+  // Проверка идёт через тот же расчёт, что у заказов, но ничего не списывает: потребность
+  // складывается по всем блюдам заявки сразу.
+  let stockTimer = 0
+  let stockRequest = 0
+  function scheduleStockCheck() {
+    clearTimeout(stockTimer)
+    stockTimer = setTimeout(checkStock, 350)
+  }
+
+  async function checkStock() {
+    const order = items
+      .map((item) => ({ dishId: String(item.dishId || ''), portions: portionsValue(item.portions) }))
+      .filter((item) => item.dishId && item.portions)
+    if (!order.length) {
+      stockNode.hidden = true
+      return
+    }
+    const ticket = ++stockRequest
+    try {
+      const result = await API.post('/orders/validate', { items: order })
+      if (ticket !== stockRequest) return
+      stockNode.hidden = false
+      if (result.ok) {
+        stockNode.className = 'request-stock is-ok'
+        stockNode.innerHTML = '<strong>Продуктов на складе хватает на все порции.</strong><span>Склад при сохранении заявки не меняется — продукты спишутся, когда заказ оформят во вкладке «Заказы».</span>'
+        return
+      }
+      stockNode.className = 'request-stock is-short'
+      stockNode.innerHTML = '<strong>На все порции не хватит продуктов — нужно докупить:</strong><ul>' +
+        result.shortages.map((item) => '<li><b>' + UI.escapeHtml(item.productName) + '</b> — нужно ' + UI.formatQuantity(item.required, item.unit) +
+          ', есть ' + UI.formatQuantity(item.available, item.unit) + ', не хватает <b>' + UI.formatQuantity(item.missing, item.unit) + '</b>' +
+          (item.dishes && item.dishes.length ? ' <span class="request-muted">(' + UI.escapeHtml(item.dishes.join(', ')) + ')</span>' : '') + '</li>').join('') +
+        '</ul><span>Заявку можно сохранить и так — это предложение заказчику, склад не меняется.</span>'
+    } catch (error) {
+      if (ticket !== stockRequest) return
+      stockNode.hidden = false
+      stockNode.className = 'request-stock is-short'
+      stockNode.textContent = 'Не удалось проверить остатки: ' + error.message
     }
   }
 
   rowsNode.addEventListener('change', (event) => {
-    const productSelect = event.target.closest('[data-product-select]')
-    if (!productSelect) return
-    const index = Number(productSelect.dataset.productSelect)
-    const item = items[index]
+    const dishSelect = event.target.closest('[data-dish-select]')
+    if (!dishSelect) return
+    const item = items[Number(dishSelect.dataset.dishSelect)]
     if (!item) return
-    const oldUnit = item.unit
-    const product = productByID(productSelect.value)
-    if (!product) {
-      item.productId = ''
-      item.unitMismatch = false
-      renderRows()
-      return
-    }
-    const quantity = quantityValue(item.quantity)
-    let unitMismatch = false
-    if (oldUnit) {
-      const converted = convertQuantity(quantity, oldUnit, product.unit)
-      if (converted !== null) item.quantity = converted
-      else if (oldUnit !== product.unit) {
-        unitMismatch = true
-        renderWarnings(['У позиции «' + (item.originalName || item.productName) + '» единица из документа отличается от каталога. Проверь количество вручную.'])
-      }
-    }
-    item.productId = String(product.id)
-    item.productName = product.name
-    item.catalogMatch = true
-    item.unitMismatch = unitMismatch
-    item.available = Number(product.available || 0)
-    item.unit = product.unit
-    item.unitPriceKopecks = product.basePriceKopecks || 0
-    item.priceConfigured = Boolean(product.priceConfigured)
+    item.dishId = dishSelect.value
+    item.catalogMatch = Boolean(dishSelect.value)
     item.manualPrice = ''
     renderRows()
   })
 
   rowsNode.addEventListener('input', (event) => {
-    const quantityInput = event.target.closest('[data-quantity]')
+    const portionsInput = event.target.closest('[data-portions]')
     const discountInput = event.target.closest('[data-item-discount]')
     const priceInput = event.target.closest('[data-item-price]')
-    if (priceInput) {
-      const index = Number(priceInput.dataset.itemPrice)
-      if (items[index]) items[index].manualPrice = priceInput.value
-    }
-    if (quantityInput) {
-      const index = Number(quantityInput.dataset.quantity)
-      if (items[index]) items[index].quantity = quantityInput.value
-    }
-    if (discountInput) {
-      const index = Number(discountInput.dataset.itemDiscount)
-      if (items[index]) items[index].itemDiscountPercent = discountValue(discountInput.value)
-    }
-    if (quantityInput || discountInput || priceInput) updateTotals()
+    if (priceInput && items[Number(priceInput.dataset.itemPrice)]) items[Number(priceInput.dataset.itemPrice)].manualPrice = priceInput.value
+    if (portionsInput && items[Number(portionsInput.dataset.portions)]) items[Number(portionsInput.dataset.portions)].portions = portionsInput.value
+    if (discountInput && items[Number(discountInput.dataset.itemDiscount)]) items[Number(discountInput.dataset.itemDiscount)].itemDiscountPercent = discountValue(discountInput.value)
+    if (portionsInput || discountInput || priceInput) updateTotals()
   })
 
   rowsNode.addEventListener('click', (event) => {
@@ -413,14 +367,9 @@
   })
 
   el('addRequestItem').addEventListener('click', () => {
-    items.push({
-      originalName: '', productName: '', productId: '', quantity: 1, unit: '',
-      unitPriceKopecks: 0, priceConfigured: false, available: 0, catalogMatch: false,
-      unitMismatch: false, manualPrice: '', itemDiscountPercent: 0, confidence: 1
-    })
+    items.push({ originalName: '', dishId: '', portions: 10, catalogMatch: false, manualPrice: '', itemDiscountPercent: 0 })
     renderRows()
-    const last = items.length - 1
-    const select = rowsNode.querySelector('[data-product-select="' + last + '"]')
+    const select = rowsNode.querySelector('[data-dish-select="' + (items.length - 1) + '"]')
     if (select) select.focus()
   })
 
@@ -437,13 +386,9 @@
       sourceHash: currentSourceHash,
       globalDiscountPercent: globalDiscount,
       items: items.map((item) => {
-        const row = {
-          productId: String(item.productId),
-          quantity: quantityValue(item.quantity),
-          itemDiscountPercent: discountValue(item.itemDiscountPercent),
-        }
-        const product = productByID(item.productId)
-        if (product && !product.priceConfigured) row.unitPriceKopecks = manualPriceKopecks(item.manualPrice)
+        const row = { dishId: String(item.dishId), portions: portionsValue(item.portions), itemDiscountPercent: discountValue(item.itemDiscountPercent) }
+        const dish = dishByID(item.dishId)
+        if (dish && !dish.priceConfigured) row.unitPriceKopecks = manualPriceKopecks(item.manualPrice)
         return row
       }),
     }
@@ -451,28 +396,30 @@
     saveButton.textContent = 'Сохраняем…'
     try {
       const saved = await API.post('/requests', payload)
-      message(saveMessage, 'Заявка ' + saved.number + ' сохранена в БД. Итого: ' + rubles(saved.totalKopecks) + '.', false)
+      message(saveMessage, 'Заявка ' + saved.number + ' сохранена. Итого: ' + rubles(saved.totalKopecks) + '.', false)
       items = []
       currentSourceFilename = ''
       currentSourceHash = ''
       globalDiscount = 0
       globalDiscountNode.value = '0'
       editor.hidden = true
+      stockNode.hidden = true
       duplicateSaved = false
       renderWarnings([])
       message(uploadMessage, 'Заявка сохранена: ' + saved.number, false)
       await loadHistory()
     } catch (error) {
       message(saveMessage, error.message || 'Не удалось сохранить заявку.', true)
-      updateTotals()
     } finally {
       saveButton.textContent = 'Сохранить заявку'
       updateTotals()
     }
   })
 
-  async function saveCatalogPrice(productID) {
-    const input = catalogNode.querySelector('[data-price-input="' + productID + '"]')
+  /* ---------- Цены порций ---------- */
+
+  async function saveDishPrice(dishID) {
+    const input = catalogNode.querySelector('[data-price-input="' + dishID + '"]')
     if (!input) return
     const value = Number(String(input.value).replace(',', '.'))
     if (!Number.isFinite(value) || value < 0 || value > 10000000000) {
@@ -481,21 +428,20 @@
       input.setCustomValidity('')
       return
     }
-    const button = catalogNode.querySelector('[data-save-price="' + productID + '"]')
+    const button = catalogNode.querySelector('[data-save-price="' + dishID + '"]')
     if (button) {
       button.disabled = true
       button.textContent = '…'
     }
     try {
-      await API.post('/products/' + encodeURIComponent(productID) + '/price', { priceKopecks: Math.round(value * 100) })
-      await loadCatalog()
-      if (items.length) updateTotals()
+      await API.post('/dishes/' + encodeURIComponent(dishID) + '/price', { priceKopecks: Math.round(value * 100) })
+      await loadMenu()
     } catch (error) {
       if (button) {
         button.disabled = false
         button.textContent = 'Сохранить'
       }
-      const row = catalogNode.querySelector('[data-price-row="' + productID + '"]')
+      const row = catalogNode.querySelector('[data-price-row="' + dishID + '"]')
       if (row) {
         let warning = row.querySelector('.price-error')
         if (!warning) {
@@ -509,25 +455,26 @@
   }
 
   function renderPrices() {
-    if (!catalog.length) {
-      catalogNode.innerHTML = '<tr><td colspan="4" class="request-muted">Каталог пока пуст. Добавь товары через раздел «Поставки».</td></tr>'
+    if (!menu.length) {
+      catalogNode.innerHTML = '<tr><td colspan="3" class="request-muted">Меню пока пустое. Добавь блюда во вкладке «Меню».</td></tr>'
       return
     }
-    catalogNode.innerHTML = catalog.map((product) => {
-      const displayPrice = product.priceConfigured ? asMoneyInput(product.basePriceKopecks, true) : ''
-      return '<tr data-price-row="' + UI.escapeHtml(product.id) + '">' +
-        '<td>' + UI.escapeHtml(product.name) + (product.priceConfigured ? '' : '<span class="request-unit-price-note request-not-set">Цена не задана</span>') + '</td>' +
-        '<td>' + UI.escapeHtml(units[product.unit] || product.unit) + '</td>' +
-        '<td><div class="price-edit"><input class="input" data-price-input="' + UI.escapeHtml(product.id) + '" type="number" min="0" max="10000000000" step="0.01" value="' + displayPrice + '" placeholder="0,00" ' + (!admin ? 'disabled' : '') + ' aria-label="Цена для ' + UI.escapeHtml(product.name) + '" /><span>₽</span></div></td>' +
-        '<td><button type="button" class="btn btn-line btn-sm" data-save-price="' + UI.escapeHtml(product.id) + '"' + (!admin ? ' disabled' : '') + '>Сохранить</button></td>' +
+    catalogNode.innerHTML = menu.map((dish) => {
+      const id = UI.escapeHtml(dish.dishId)
+      return '<tr data-price-row="' + id + '">' +
+        '<td>' + UI.escapeHtml(dish.name) + (dish.priceConfigured ? '' : '<span class="request-unit-price-note request-not-set">Цена не задана</span>') + '</td>' +
+        '<td><div class="price-edit"><input class="input" data-price-input="' + id + '" type="number" min="0" max="10000000000" step="0.01" value="' + (dish.priceConfigured ? rawMoney(dish.priceKopecks) : '') + '" placeholder="0,00" ' + (!admin ? 'disabled' : '') + ' aria-label="Цена порции: ' + UI.escapeHtml(dish.name) + '" /><span>₽</span></div></td>' +
+        '<td><button type="button" class="btn btn-line btn-sm" data-save-price="' + id + '"' + (!admin ? ' disabled' : '') + '>Сохранить</button></td>' +
         '</tr>'
     }).join('')
   }
 
   catalogNode.addEventListener('click', (event) => {
     const button = event.target.closest('[data-save-price]')
-    if (button) saveCatalogPrice(button.dataset.savePrice)
+    if (button) saveDishPrice(button.dataset.savePrice)
   })
+
+  /* ---------- История ---------- */
 
   async function loadHistory() {
     try {
@@ -539,6 +486,7 @@
       historyNode.innerHTML = requests.map((request) => {
         const created = request.createdAt ? new Date(request.createdAt).toLocaleString('ru-RU') : '—'
         const lines = Array.isArray(request.items) ? request.items : []
+        const portions = lines.reduce((sum, line) => sum + Number(line.portions || 0), 0)
         return '<details class="request-history-card"><summary>' +
           '<span class="request-history-number">' + UI.escapeHtml(request.number) + '</span>' +
           '<span class="request-history-customer">' + UI.escapeHtml(request.customerName) + '</span>' +
@@ -546,9 +494,9 @@
           '<span class="request-status-label">Сохранена</span>' +
           '<strong class="request-history-total">' + rubles(request.totalKopecks) + '</strong>' +
           '</summary><div class="request-history-detail">' +
-          '<div class="request-history-meta">Позиций: ' + lines.length + ' · Скидка: ' + rubles(request.discountKopecks) + (request.sourceFilename ? ' · Файл: ' + UI.escapeHtml(request.sourceFilename) : '') + '</div>' +
-          '<div class="request-table-wrap"><table class="request-history-table"><thead><tr><th>Товар</th><th>Количество</th><th>Цена</th><th>Скидка</th><th>Сумма</th></tr></thead><tbody>' +
-          lines.map((line) => '<tr><td>' + UI.escapeHtml(line.productName) + '</td><td>' + number.format(line.quantity) + ' ' + UI.escapeHtml(units[line.unit] || line.unit) + '</td><td>' + rubles(line.unitPriceKopecks) + '</td><td>' + Number(line.itemDiscountPercent || 0) + '%</td><td class="request-history-total">' + rubles(line.totalKopecks) + '</td></tr>').join('') +
+          '<div class="request-history-meta">Блюд: ' + lines.length + ' · Порций: ' + portions + ' · Скидка: ' + rubles(request.discountKopecks) + (request.sourceFilename ? ' · Файл: ' + UI.escapeHtml(request.sourceFilename) : '') + '</div>' +
+          '<div class="request-table-wrap"><table class="request-history-table"><thead><tr><th>Блюдо</th><th>Порций</th><th>Цена порции</th><th>Скидка</th><th>Сумма</th></tr></thead><tbody>' +
+          lines.map((line) => '<tr><td>' + UI.escapeHtml(line.dishName) + '</td><td>' + Number(line.portions || 0) + '</td><td>' + rubles(line.unitPriceKopecks) + '</td><td>' + Number(line.itemDiscountPercent || 0) + '%</td><td class="request-history-total">' + rubles(line.totalKopecks) + '</td></tr>').join('') +
           '</tbody></table></div></div></details>'
       }).join('')
     } catch (error) {
@@ -559,10 +507,8 @@
   el('refreshRequests').addEventListener('click', loadHistory)
 
   async function init() {
-    if (!admin) {
-      updateAIStatus('Режим просмотра', 'Заявки и цены может изменять администратор.', true)
-    }
-    await Promise.all([loadCatalog(), loadHistory()])
+    if (!admin) updateAIStatus('Режим просмотра', 'Заявки и цены может изменять администратор.', true)
+    await Promise.all([loadMenu(), loadHistory()])
   }
 
   init()

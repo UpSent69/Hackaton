@@ -10,10 +10,25 @@ services:
       JWT_SECRET: ${JWT_SECRET:-local-development-only-change-this-secret}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:2b}
+      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+    depends_on:
+      - redis
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - db_data:/root/data
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Redis: сессии, кэш, ревизия данных, ограничение частоты и очередь распознавания документов.
+  # Основные данные склада остаются в SQLite; без Redis бэкенд продолжает работать.
+  redis:
+    image: redis:7.4-alpine
+    container_name: hackaton-redis
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
     networks:
       - app-network
     restart: unless-stopped
@@ -48,6 +63,7 @@ services:
 volumes:
   db_data:
   ollama_data:
+  redis_data:
 
 networks:
   app-network:

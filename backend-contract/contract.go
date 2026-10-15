@@ -197,6 +197,8 @@ type Dish struct {
 	StoppedSince      *time.Time   `json:"stoppedSince"` // с какого момента блюдо в стопе; иначе null
 	Hot               bool         `json:"hot"`          // блюдо есть в горячих предложениях
 	HotScore          int          `json:"hotScore"`     // его приоритет там, 0 если нет
+	PriceKopecks      int64        `json:"priceKopecks"`    // цена порции для заявок; 0, если не задана
+	PriceConfigured   bool         `json:"priceConfigured"` // задана ли цена порции
 }
 
 type Ingredient struct {

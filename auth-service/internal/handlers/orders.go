@@ -15,10 +15,13 @@ import (
 func (a *API) buildDish(id int64, now time.Time) (contract.Dish, error) {
 	var dish contract.Dish
 	var stoppedSince sql.NullString
-	if err := a.DB.QueryRow("SELECT id,name,stopped_since FROM dishes WHERE id=?", id).
-		Scan(&id, &dish.Name, &stoppedSince); err != nil {
+	var price sql.NullInt64
+	if err := a.DB.QueryRow("SELECT id,name,stopped_since,price_kopecks FROM dishes WHERE id=?", id).
+		Scan(&id, &dish.Name, &stoppedSince, &price); err != nil {
 		return dish, err
 	}
+	dish.PriceConfigured = price.Valid
+	dish.PriceKopecks = price.Int64
 	dish.DishID = strconv.FormatInt(id, 10)
 	dish.Ingredients = make([]contract.Ingredient, 0)
 	rows, err := a.DB.Query(

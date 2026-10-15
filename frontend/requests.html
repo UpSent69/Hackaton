@@ -8,9 +8,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css" />
-  <link rel="stylesheet" href="requests.css" />
-  <script src="motion.js"></script>
+  <link rel="stylesheet" href="styles.css?v=20261015-4" />
+  <link rel="stylesheet" href="requests.css?v=20261015-4" />
+  <script src="motion.js?v=20261015-4"></script>
 </head>
 <body>
   <div class="app" id="app">
@@ -18,9 +18,9 @@
       <section class="request-hero rise">
         <div class="panel-bg"><i></i><i></i><span class="grain"></span></div>
         <div class="request-hero-copy">
-          <span class="label home-badge">AI · Документы · Каталог</span>
+          <span class="label home-badge">AI · Банкеты · Меню</span>
           <h1 class="page-title">Заявка</h1>
-          <p class="page-sub">Загрузи документ — нейросеть подготовит позиции, найдёт товары в каталоге и подставит цены. Перед сохранением всё можно проверить и изменить.</p>
+          <p class="page-sub">Заявка заказчика на банкет или кейтеринг: загрузи документ — нейросеть найдёт блюда в меню, подставит цены порций и проверит, хватит ли продуктов на складе. Перед сохранением всё можно изменить.</p>
         </div>
         <div class="request-hero-mark" aria-hidden="true">
           <div class="request-file-icon">
@@ -84,9 +84,9 @@
           <table class="request-table">
             <thead>
               <tr>
-                <th>Товар из каталога</th>
-                <th>Кол-во</th>
-                <th>Цена за ед.</th>
+                <th>Блюдо из меню</th>
+                <th>Порций</th>
+                <th>Цена порции</th>
                 <th>Скидка строки</th>
                 <th class="request-total-column">Сумма</th>
                 <th><span class="sr-only">Удалить</span></th>
@@ -96,9 +96,10 @@
           </table>
         </div>
         <div class="request-table-actions">
-          <button class="btn btn-line btn-sm" type="button" id="addRequestItem">+ Добавить позицию</button>
-          <span class="request-match-legend"><i class="legend-match"></i> найдено в каталоге <i class="legend-review"></i> требует выбора</span>
+          <button class="btn btn-line btn-sm" type="button" id="addRequestItem">+ Добавить блюдо</button>
+          <span class="request-match-legend"><i class="legend-match"></i> найдено в меню <i class="legend-review"></i> требует выбора</span>
         </div>
+        <div class="request-stock" id="requestStock" hidden aria-live="polite"></div>
 
         <div class="request-bottom-grid">
           <div class="request-discount-panel">
@@ -123,16 +124,16 @@
 
       <details class="request-prices glass rise" id="pricesPanel">
         <summary>
-          <div><span class="label">03 / Справочник</span><h2 class="panel-title">Цены каталога</h2><p class="page-sub">Базовые цены хранятся в БД. Скидки в заявке не меняют сам каталог.</p></div>
+          <div><span class="label">03 / Справочник</span><h2 class="panel-title">Цены порций</h2><p class="page-sub">Цена порции каждого блюда меню хранится в БД. Скидки в заявке её не меняют.</p></div>
           <span class="request-details-chevron" aria-hidden="true">⌄</span>
         </summary>
         <div class="request-table-wrap">
           <table class="request-table request-price-table">
-            <thead><tr><th>Товар</th><th>Единица каталога</th><th>Цена за единицу, ₽</th><th></th></tr></thead>
-            <tbody id="catalogPrices"><tr><td colspan="4">Загрузка каталога…</td></tr></tbody>
+            <thead><tr><th>Блюдо</th><th>Цена порции, ₽</th><th></th></tr></thead>
+            <tbody id="catalogPrices"><tr><td colspan="3">Загрузка меню…</td></tr></tbody>
           </table>
         </div>
-        <p class="request-prices-note">Цены каталога хранятся в БД. Если цена не задана, можно ввести разовую цену прямо в строке черновика — она сохранится только в этой заявке и не изменит каталог.</p>
+        <p class="request-prices-note">Если цена порции не задана, можно ввести разовую цену прямо в строке черновика — она сохранится только в этой заявке и не изменит меню.</p>
       </details>
 
       <section class="request-history rise" aria-labelledby="historyTitle">
@@ -145,8 +146,8 @@
     </main>
   </div>
 
-  <script src="api.js"></script>
-  <script src="shared.js"></script>
-  <script src="requests.js"></script>
+  <script src="api.js?v=20261015-4"></script>
+  <script src="shared.js?v=20261015-4"></script>
+  <script src="requests.js?v=20261015-4"></script>
 </body>
 </html>

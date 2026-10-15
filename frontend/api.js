@@ -116,10 +116,23 @@ const API = (() => {
     const data = await response.json().catch(() => null)
     if (!response.ok) {
       const down = response.status >= 502 && response.status <= 504
-      throw new ApiError(response.status, down ? 'Сервер недоступен' : data && data.message, data)
+      const tooBig = response.status === 413 && !(data && data.message)
+      throw new ApiError(response.status, down ? 'Сервер недоступен' : tooBig ? 'Файл слишком большой: максимум 12 МБ' : data && data.message, data)
     }
     syncClock(data)
     return data
+  }
+
+  // Распознавание документа идёт в очереди на сервере: ответ 202 с номером задачи.
+  // awaitJob переспрашивает /jobs/{id}, пока результат не готов, и возвращает его.
+  async function awaitJob(result) {
+    const started = Date.now()
+    while (result && result.status === 'pending' && result.jobId) {
+      if (Date.now() - started > 5 * 60 * 1000) throw new ApiError(504, 'Распознавание заняло больше 5 минут. Попробуйте ещё раз.')
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      result = await remote('GET', '/jobs/' + encodeURIComponent(result.jobId))
+    }
+    return result
   }
 
   /* ---------- Публичный интерфейс ---------- */
@@ -129,6 +142,7 @@ const API = (() => {
     get: (path) => remote('GET', path),
     post: (path, body) => remote('POST', path, body),
     upload: (path, file) => upload(path, file),
+    awaitJob,
     del: (path) => remote('DELETE', path),
     getUser,
     setSession,

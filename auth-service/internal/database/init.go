@@ -75,13 +75,7 @@ func Init(dbPath string) (*sql.DB, error) {
 		"subtotal_kopecks INTEGER NOT NULL DEFAULT 0, total_kopecks INTEGER NOT NULL DEFAULT 0, " +
 		"created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'saved');" +
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_requests_source_hash ON customer_requests(source_sha256) WHERE source_sha256 <> '';" +
-		"CREATE TABLE IF NOT EXISTS customer_request_items (" +
-		"id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES customer_requests(id) ON DELETE CASCADE, " +
-		"product_id INTEGER NOT NULL REFERENCES products(id), product_name TEXT NOT NULL, unit TEXT NOT NULL, " +
-		"quantity REAL NOT NULL CHECK(quantity > 0), unit_price_kopecks INTEGER NOT NULL CHECK(unit_price_kopecks >= 0), " +
-		"item_discount_percent INTEGER NOT NULL CHECK(item_discount_percent BETWEEN 0 AND 100), " +
-		"subtotal_kopecks INTEGER NOT NULL, total_kopecks INTEGER NOT NULL);" +
-		"CREATE INDEX IF NOT EXISTS idx_customer_request_items_request ON customer_request_items(request_id, id);" +
+		requestItemsSchema +
 		"CREATE TABLE IF NOT EXISTS supply_imports (" +
 		"id INTEGER PRIMARY KEY AUTOINCREMENT, source_filename TEXT NOT NULL DEFAULT '', source_sha256 TEXT NOT NULL DEFAULT '', " +
 		"parser_mode TEXT NOT NULL, ai_used INTEGER NOT NULL DEFAULT 0, detected_number TEXT NOT NULL DEFAULT '', " +
@@ -101,6 +95,15 @@ func Init(dbPath string) (*sql.DB, error) {
 	if err := ensureColumn(db, "products", "base_price_kopecks", "INTEGER NULL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate product catalogue price: %w", err)
+	}
+	// Цена порции блюда — по ней считаются заявки на банкеты.
+	if err := ensureColumn(db, "dishes", "price_kopecks", "INTEGER NULL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate dish price: %w", err)
+	}
+	if err := migrateRequestItems(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate request items: %w", err)
 	}
 	// Batch (lot) number of a supply row; older batches simply keep an empty value.
 	if err := ensureColumn(db, "batches", "lot_number", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -202,6 +205,58 @@ func migrateRoles(db *sql.DB) error {
 		"DROP TABLE accounts",
 		"ALTER TABLE accounts_new RENAME TO accounts",
 		"UPDATE accounts SET role='admin' WHERE id IN (SELECT id FROM accounts ORDER BY id LIMIT 2)",
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// Позиции заявки — блюда меню с числом порций. Название и цена сохраняются снимком, поэтому
+// заявка не меняется, если блюдо потом переименуют, удалят или поменяют ему цену.
+const requestItemsSchema = "CREATE TABLE IF NOT EXISTS customer_request_items (" +
+	"id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES customer_requests(id) ON DELETE CASCADE, " +
+	"dish_id INTEGER NOT NULL, dish_name TEXT NOT NULL, portions INTEGER NOT NULL CHECK(portions > 0), " +
+	"unit_price_kopecks INTEGER NOT NULL CHECK(unit_price_kopecks >= 0), " +
+	"item_discount_percent INTEGER NOT NULL CHECK(item_discount_percent BETWEEN 0 AND 100), " +
+	"subtotal_kopecks INTEGER NOT NULL, total_kopecks INTEGER NOT NULL);" +
+	"CREATE INDEX IF NOT EXISTS idx_customer_request_items_request ON customer_request_items(request_id, id);"
+
+// migrateRequestItems переводит заявки с продуктов на блюда. Старые заявки на продукты
+// удаляются (по решению команды), таблица позиций создаётся заново.
+func migrateRequestItems(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(customer_request_items)")
+	if err != nil {
+		return err
+	}
+	productBased := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, typ string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "product_id" {
+			productBased = true
+		}
+	}
+	rows.Close()
+	if !productBased {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, statement := range []string{
+		"DELETE FROM customer_request_items",
+		"DELETE FROM customer_requests",
+		"DROP TABLE customer_request_items",
+		requestItemsSchema,
 	} {
 		if _, err := tx.Exec(statement); err != nil {
 			return err

@@ -41,8 +41,9 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		a.sendJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("POST /api/auth/register", a.Register)
-	mux.HandleFunc("POST /api/auth/login", a.Login)
+	// Подбор пароля и массовые регистрации ограничены по адресу клиента.
+	mux.HandleFunc("POST /api/auth/register", a.rateLimited("register", 5, time.Minute, false, a.Register))
+	mux.HandleFunc("POST /api/auth/login", a.rateLimited("login", 10, time.Minute, false, a.Login))
 	mux.HandleFunc("GET /api/auth/registration", a.Registration)
 
 	authed := func(method, path string, admin bool, handler http.HandlerFunc) {
@@ -56,34 +57,38 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("POST", "/api/users", true, a.CreateManager)
 	authed("DELETE", "/api/users/{id}", true, a.DeleteManager)
 
-	authed("GET", "/api/products", false, a.Products)
+	// Каталог, остатки, меню, горячие предложения и аналитика кэшируются в Redis по ревизии данных.
+	authed("GET", "/api/products", false, a.cachedJSON("products", a.Products))
 	authed("POST", "/api/products/{productId}/price", true, a.UpdateProductPrice)
 	authed("GET", "/api/requests", false, a.Requests)
 	authed("GET", "/api/requests/{id}", false, a.RequestByID)
 	authed("POST", "/api/requests", true, a.CreateRequest)
-	mux.Handle("POST /api/requests/parse", a.protectLongRunning(false, a.ParseRequestFile))
-	authed("GET", "/api/stock", false, a.Stock)
+	mux.Handle("POST /api/requests/parse", a.protectLongRunning(false, a.rateLimited("parse", 10, time.Minute, true, a.ParseRequestFile)))
+	authed("GET", "/api/jobs/{id}", false, a.Job)
+	authed("GET", "/api/stock", false, a.cachedJSON("stock", a.Stock))
 	authed("GET", "/api/stock/{productId}/batches", false, a.Batches)
 	authed("GET", "/api/expiry", false, a.Expiry)
 	authed("GET", "/api/supplies", false, a.Supplies)
 	authed("POST", "/api/supplies", true, a.CreateSupply)
-	mux.Handle("POST /api/supplies/parse", a.protectLongRunning(true, a.ParseSupplyFile))
+	mux.Handle("POST /api/supplies/parse", a.protectLongRunning(true, a.rateLimited("parse", 10, time.Minute, true, a.ParseSupplyFile)))
 	authed("DELETE", "/api/supplies/{id}", true, a.DeleteSupply)
 	authed("DELETE", "/api/supplies/{id}/items/{productId}", true, a.DeleteSupplyItem)
 
-	authed("GET", "/api/menu", false, a.Menu)
+	authed("GET", "/api/menu", false, a.cachedJSON("menu", a.Menu))
 	authed("POST", "/api/dishes", true, a.CreateDish)
 	authed("DELETE", "/api/dishes/{id}", true, a.DeleteDish)
+	authed("POST", "/api/dishes/{id}/price", true, a.UpdateDishPrice)
 	authed("POST", "/api/orders/validate", false, a.ValidateOrder)
 	authed("POST", "/api/orders", true, a.CreateOrder)
 	authed("GET", "/api/orders", false, a.Orders)
 
 	authed("GET", "/api/alerts", false, a.Alerts)
 	authed("GET", "/api/pulse", false, a.Pulse)
-	authed("GET", "/api/hot-offers", false, a.HotOffers)
-	authed("GET", "/api/analytics", false, a.Analytics)
+	authed("GET", "/api/hot-offers", false, a.cachedJSON("hot-offers", a.HotOffers))
+	authed("GET", "/api/analytics", false, a.cachedJSON("analytics", a.Analytics))
 	mux.Handle("GET /api/analytics/ai", a.protectLongRunning(false, a.AnalyticsInsight))
 	go requestimport.Warmup(requestimport.OllamaConfig())
+	a.startDocumentWorker()
 
 	authed("GET", "/api/demo/state", false, a.DemoState)
 	authed("POST", "/api/demo/clock", true, a.DemoClock)
@@ -172,6 +177,20 @@ func (a *API) authenticate(r *http.Request) (*authContext, error) {
 		return nil, errors.New("invalid session claim")
 	}
 
+	// Быстрый путь: сессия в Redis (живёт до истечения токена). Пользователь и роль всё равно
+	// читаются из SQLite, чтобы смена роли действовала сразу.
+	if uid, ok := a.KV.Get("session:" + tokenID); ok && uid == strconv.FormatInt(int64(idValue), 10) {
+		var user contract.User
+		var userID int64
+		var role string
+		if err := a.DB.QueryRow("SELECT id,name,email,role FROM accounts WHERE id=?", int64(idValue)).Scan(&userID, &user.Name, &user.Email, &role); err == nil &&
+			(role == string(contract.RoleAdmin) || role == string(contract.RoleManager)) {
+			user.ID = strconv.FormatInt(userID, 10)
+			user.Role = contract.Role(role)
+			return &authContext{User: user, TokenID: tokenID}, nil
+		}
+	}
+
 	var id int64
 	var name, email, role, expiresAt string
 	var revoked int
@@ -191,6 +210,7 @@ func (a *API) authenticate(r *http.Request) (*authContext, error) {
 	if role != string(contract.RoleAdmin) && role != string(contract.RoleManager) {
 		return nil, errors.New("invalid role")
 	}
+	a.rememberSession(tokenID, id, time.Until(expiration))
 	return &authContext{
 		User: contract.User{ID: strconv.FormatInt(id, 10), Name: name, Email: email, Role: contract.Role(role)},
 		TokenID: tokenID,
@@ -334,13 +354,37 @@ func (a *API) createSession(userID int64, user contract.User) (contract.Session,
 	); err != nil {
 		return contract.Session{}, err
 	}
+	a.rememberSession(jti, userID, expires.Sub(now))
 	return contract.Session{Token: tokenString, User: user}, nil
+}
+
+// rememberSession кладёт сессию в Redis со сроком жизни токена. Основная запись остаётся
+// в SQLite (auth_sessions), поэтому без Redis вход продолжает работать.
+func (a *API) rememberSession(jti string, userID int64, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	uid := strconv.FormatInt(userID, 10)
+	if a.KV.Set("session:"+jti, uid, ttl) {
+		a.KV.SAdd("user-sessions:"+uid, jti, 25*time.Hour)
+	}
+}
+
+// forgetSessions удаляет из Redis все сессии пользователя (удаление менеджера).
+func (a *API) forgetSessions(userID int64) {
+	key := "user-sessions:" + strconv.FormatInt(userID, 10)
+	keys := []string{key}
+	for _, jti := range a.KV.SMembers(key) {
+		keys = append(keys, "session:"+jti)
+	}
+	a.KV.Del(keys...)
 }
 
 func (a *API) Logout(w http.ResponseWriter, r *http.Request) {
 	auth := currentAuth(r)
 	if auth != nil {
 		_, _ = a.DB.Exec("UPDATE auth_sessions SET revoked=1 WHERE jti=?", auth.TokenID)
+		a.KV.Del("session:" + auth.TokenID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -484,17 +528,27 @@ func (a *API) RevisionMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// currentRev — ревизия данных. Её спрашивает каждый ответ (X-Data-Rev) и опрос страниц раз
+// в 3 секунды, поэтому она читается из Redis; источник истины — SQLite (app_meta).
 func (a *API) currentRev() int64 {
+	if cached, ok := a.KV.Get("rev"); ok {
+		if rev, err := strconv.ParseInt(cached, 10, 64); err == nil {
+			return rev
+		}
+	}
 	var value string
 	if err := a.DB.QueryRow("SELECT value FROM app_meta WHERE key='revision'").Scan(&value); err != nil {
 		return 0
 	}
 	rev, _ := strconv.ParseInt(value, 10, 64)
+	a.KV.Set("rev", value, 0)
 	return rev
 }
 
 func (a *API) bumpRev() {
 	_, _ = a.DB.Exec("UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'")
+	// Следующее чтение возьмёт новое значение из SQLite; вместе с ним меняются и ключи кэша.
+	a.KV.Del("rev")
 }
 
 func (a *API) nowAndSpeed() (time.Time, float64) {
@@ -629,6 +683,7 @@ func (a *API) DeleteManager(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Сессии удаляются явно, не полагаясь только на каскад внешнего ключа.
+	a.forgetSessions(id)
 	if _, err := a.DB.Exec("DELETE FROM auth_sessions WHERE user_id IN (SELECT id FROM accounts WHERE id=? AND role=?)", id, string(contract.RoleManager)); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось удалить пользователя")
 		return

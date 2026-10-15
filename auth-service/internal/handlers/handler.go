@@ -9,6 +9,7 @@ import (
 // API contains the shared dependencies used by the HTTP handlers.
 type API struct {
 	DB *sql.DB
+	KV *KV // Redis: сессии, кэш, ревизия, ограничение частоты, очередь документов (может быть недоступен)
 }
 
 var jwtSecret []byte

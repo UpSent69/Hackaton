@@ -48,7 +48,7 @@ func main() {
 	}
 	handlers.SetJWTSecret([]byte(secret))
 
-	api := &handlers.API{DB: db}
+	api := &handlers.API{DB: db, KV: handlers.NewKV(os.Getenv("REDIS_ADDR"))}
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 

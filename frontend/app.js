@@ -288,6 +288,15 @@
   const runningText = (limit) =>
     `${escapeHtml(limit.productName)}: уходит ${formatQuantity(limit.required, limit.unit)} на порцию, осталось ${formatQuantity(limit.available, limit.unit)}`
 
+  const moneyFormat = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', maximumFractionDigits: 2 })
+
+  // Цена порции: администратор задаёт её прямо в таблице, менеджер только видит.
+  function dishPriceCell(dish) {
+    const value = dish.priceConfigured ? (dish.priceKopecks / 100).toFixed(2).replace(/\.00$/, '') : ''
+    if (!isAdmin()) return dish.priceConfigured ? moneyFormat.format(dish.priceKopecks / 100) : '<span class="dim">не задана</span>'
+    return `<div class="field with-unit" style="width:150px"><input class="input" data-dish-price type="number" min="0" step="0.01" inputmode="decimal" value="${value}" placeholder="0" aria-label="Цена порции, ₽" /><span>₽</span></div>`
+  }
+
   const stopBadge = (dish) =>
     dish.stopped
       ? `<span class="label status" style="--status-color:${STATUS.expired.color}">В стопе</span>`
@@ -335,7 +344,7 @@
         return
       }
       list.innerHTML = `<div class="glass table-wrap"><table class="table">
-        <thead><tr><th>Блюдо</th><th>Состав на порцию</th><th class="num">Можно приготовить</th><th>Статус</th><th></th></tr></thead>
+        <thead><tr><th>Блюдо</th><th>Состав на порцию</th><th class="num">Можно приготовить</th><th>Цена порции</th><th>Статус</th><th></th></tr></thead>
         <tbody>
           ${menu
             .map(
@@ -343,6 +352,7 @@
                 <td class="strong">${escapeHtml(dish.name)}</td>
                 <td class="dim">${dish.ingredients.map((item) => `${escapeHtml(item.name)} — ${formatQuantity(item.quantity, item.unit)}`).join(' · ')}</td>
                 <td class="num nowrap">${portionsLabel(dish.availablePortions)}</td>
+                <td class="nowrap">${dishPriceCell(dish)}</td>
                 <td>${stopBadge(dish)}${dish.stopReason ? `<div class="cell-note">${limitText(dish.stopReason)}</div>` : ''}</td>
                 <td class="num"><button type="button" class="btn btn-sm btn-line" data-delete-dish data-admin>Удалить</button></td>
               </tr>`,
@@ -367,6 +377,10 @@
           <span class="label">Название</span>
           <input class="input" id="dishName" placeholder="Например, пицца «Маргарита»" autocomplete="off" />
         </label>
+        <label class="field" style="max-width:200px">
+          <span class="label">Цена порции</span>
+          <span class="field with-unit"><input class="input" id="dishPrice" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" /><span>₽</span></span>
+        </label>
         <div class="supply-rows">
           <div class="supply-row is-recipe is-head"><span class="label">Продукт</span><span class="label">На одну порцию</span><span></span></div>
           <div id="dishRows">${ingredientRowHtml(products)}</div>
@@ -382,6 +396,7 @@
       const rows = document.getElementById('dishRows')
       const nameInput = document.getElementById('dishName')
       const message = document.getElementById('dishMsg')
+      const priceInput = document.getElementById('dishPrice')
 
       rows.addEventListener('input', (event) => event.target.classList.remove('is-invalid'))
       rows.addEventListener('change', (event) => {
@@ -408,6 +423,7 @@
           if (bad) valid = false
         }
         mark(nameInput, !nameInput.value.trim())
+        mark(priceInput, priceInput.value !== '' && !(Number(priceInput.value) >= 0))
         const ingredients = [...rows.querySelectorAll('.supply-row')].map((row) => {
           const product = row.querySelector('[name=productId]')
           const quantity = row.querySelector('[name=quantity]')
@@ -424,8 +440,10 @@
         submit.disabled = true
         try {
           const dish = await call(API.post('/dishes', { name: nameInput.value.trim(), ingredients }))
+          if (priceInput.value !== '') await call(API.post('/dishes/' + encodeURIComponent(dish.dishId) + '/price', { priceKopecks: Math.round(Number(priceInput.value) * 100) }))
           setMessage(message, `Блюдо добавлено: ${dish.name}. Можно приготовить: ${portionsLabel(dish.availablePortions)}`)
           nameInput.value = ''
+          priceInput.value = ''
           rows.innerHTML = ingredientRowHtml(products)
           await loadDishes()
         } catch (error) {
@@ -435,6 +453,28 @@
         }
       })
     }
+
+    list.addEventListener('change', async (event) => {
+      const input = event.target.closest('[data-dish-price]')
+      if (!input) return
+      const row = input.closest('tr')
+      const price = Number(input.value)
+      if (input.value === '' || !(price >= 0)) {
+        input.classList.add('is-invalid')
+        setMessage(listMsg, 'Укажите цену порции в рублях', true)
+        return
+      }
+      input.classList.remove('is-invalid')
+      input.disabled = true
+      try {
+        await call(API.post('/dishes/' + encodeURIComponent(row.dataset.dish) + '/price', { priceKopecks: Math.round(price * 100) }))
+        setMessage(listMsg, `Цена «${row.dataset.name}»: ${moneyFormat.format(Math.round(price * 100) / 100)} за порцию`)
+      } catch (error) {
+        setMessage(listMsg, error.message, true)
+      } finally {
+        input.disabled = false
+      }
+    })
 
     list.addEventListener('click', async (event) => {
       const button = event.target.closest('[data-delete-dish]')

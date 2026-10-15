@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"time"
 )
 
 // supplyNumberLine finds "Накладная № П-777", "Поставка №124" and similar headings.
@@ -87,8 +86,8 @@ func AnalyzeSupply(ctx context.Context, source Source, baseURL, model string) (S
 		return SupplyDocument{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 50 * time.Second}
-	resp, err := client.Do(req)
+	// Срок задаёт контекст вызывающего: распознавание идёт в очереди документов.
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return SupplyDocument{}, fmt.Errorf("Ollama недоступен: %w", err)
 	}

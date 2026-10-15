@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"auth-service/internal/contract"
 	"auth-service/internal/requestimport"
 	"context"
 	"crypto/sha256"
@@ -31,15 +32,14 @@ type requestCatalogProduct struct {
 	Available        int64
 }
 
+// requestPreviewItem — строка черновика заявки: блюдо меню и число порций.
 type requestPreviewItem struct {
 	OriginalName        string  `json:"originalName"`
-	ProductName         string  `json:"productName"`
-	ProductID           string  `json:"productId"`
-	CatalogMatch        bool    `json:"catalogMatch"`
-	UnitMismatch        bool    `json:"unitMismatch"`
-	Available           int64   `json:"available"`
-	Quantity            float64 `json:"quantity"`
-	Unit                string  `json:"unit"`
+	DishName            string  `json:"dishName"`
+	DishID              string  `json:"dishId"`
+	CatalogMatch        bool    `json:"catalogMatch"` // блюдо найдено в меню
+	Portions            int64   `json:"portions"`
+	AvailablePortions   int64   `json:"availablePortions"` // сколько можно приготовить из остатков сейчас
 	UnitPriceKopecks    int64   `json:"unitPriceKopecks"`
 	PriceConfigured     bool    `json:"priceConfigured"`
 	ItemDiscountPercent int     `json:"itemDiscountPercent"`
@@ -55,7 +55,7 @@ type parsedRequestResponse struct {
 	DuplicateSaved bool                 `json:"duplicateSaved"`
 	Items          []requestPreviewItem `json:"items"`
 	Warnings       []string             `json:"warnings"`
-	Catalog        []requestCatalogDTO  `json:"catalog"`
+	Catalog        []contract.Dish      `json:"catalog"` // меню с ценами порций
 }
 
 type requestCatalogDTO struct {
@@ -76,21 +76,20 @@ type createRequestInput struct {
 }
 
 type createRequestItem struct {
-	ProductID           string  `json:"productId"`
-	Quantity            float64 `json:"quantity"`
-	ItemDiscountPercent int     `json:"itemDiscountPercent"`
-	UnitPriceKopecks    *int64  `json:"unitPriceKopecks"`
+	DishID              string `json:"dishId"`
+	Portions            int64  `json:"portions"`
+	ItemDiscountPercent int    `json:"itemDiscountPercent"`
+	UnitPriceKopecks    *int64 `json:"unitPriceKopecks"` // только для блюда без цены порции
 }
 
 type savedRequestItem struct {
-	ProductID           string  `json:"productId"`
-	ProductName         string  `json:"productName"`
-	Unit                string  `json:"unit"`
-	Quantity            float64 `json:"quantity"`
-	UnitPriceKopecks    int64   `json:"unitPriceKopecks"`
-	ItemDiscountPercent int     `json:"itemDiscountPercent"`
-	SubtotalKopecks     int64   `json:"subtotalKopecks"`
-	TotalKopecks        int64   `json:"totalKopecks"`
+	DishID              string `json:"dishId"`
+	DishName            string `json:"dishName"`
+	Portions            int64  `json:"portions"`
+	UnitPriceKopecks    int64  `json:"unitPriceKopecks"`
+	ItemDiscountPercent int    `json:"itemDiscountPercent"`
+	SubtotalKopecks     int64  `json:"subtotalKopecks"`
+	TotalKopecks        int64  `json:"totalKopecks"`
 }
 
 type savedRequest struct {
@@ -208,18 +207,31 @@ func (a *API) ParseRequestFile(w http.ResponseWriter, r *http.Request) {
 	}
 	hash := sha256.Sum256(data)
 	hashHex := hex.EncodeToString(hash[:])
-
-	baseURL, model := requestimport.OllamaConfig()
-
 	log.Printf(
-		"Импорт заявки: файл=%s, размер=%d байт, текст=%d символов, изображение=%d байт, модель=%s",
-		filename,
-		len(data),
-		len([]rune(source.Text)),
-		len(source.Image),
-		model,
+		"Импорт заявки: файл=%s, размер=%d байт, текст=%d символов, изображение=%d байт",
+		filename, len(data), len([]rune(source.Text)), len(source.Image),
 	)
 
+	// Простые списки разбираются сразу, всё остальное — через очередь Qwen.
+	if isPlainTable(filename, source) {
+		if document := requestimport.Fallback(source.Text); len(document.Items) > 0 {
+			names := make([]string, 0, len(document.Items))
+			for _, item := range document.Items {
+				names = append(names, item.ProductName)
+			}
+			if !needsModelMatch(names, a.dishNames()) {
+				a.finishRequestParse(r.Context(), w, filename, hashHex, source)
+				return
+			}
+		}
+	}
+	a.enqueueDocument(w, "request", filename, hashHex, source)
+}
+
+// finishRequestParse распознаёт заявку и сопоставляет позиции с каталогом. Заявка здесь
+// не сохраняется. Вызывается из запроса (простые списки) или из очереди документов.
+func (a *API) finishRequestParse(ctx context.Context, w http.ResponseWriter, filename, hashHex string, source requestimport.Source) {
+	baseURL, model := requestimport.OllamaConfig()
 	warnings := make([]string, 0)
 	var document requestimport.Document
 	var aiErr error
@@ -228,9 +240,7 @@ func (a *API) ParseRequestFile(w http.ResponseWriter, r *http.Request) {
 
 	// Small text lists are faster and more reliable with a deterministic parser;
 	// don't wait for a local LLM to interpret a simple "name quantity unit" row.
-	ext := strings.ToLower(filepath.Ext(filename))
-	structuredText := source.Text != "" && (ext == ".txt" || ext == ".csv" || ext == ".tsv" || ext == ".md" || ext == ".log")
-	if structuredText {
+	if isPlainTable(filename, source) {
 		candidate := requestimport.Fallback(source.Text)
 		if len(candidate.Items) > 0 {
 			document = candidate
@@ -239,9 +249,9 @@ func (a *API) ParseRequestFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if parserMode != "structured" {
-		ctx, cancel := context.WithTimeout(r.Context(), 26*time.Second)
+		aiCtx, cancel := context.WithTimeout(ctx, jobTimeout)
 		started := time.Now()
-		document, aiErr = requestimport.Analyze(ctx, source, baseURL, model)
+		document, aiErr = requestimport.Analyze(aiCtx, source, baseURL, model)
 		elapsed := time.Since(started)
 		cancel()
 		log.Printf("Анализ Ollama завершён: время=%s, ошибка=%v", elapsed, aiErr)
@@ -274,54 +284,49 @@ func (a *API) ParseRequestFile(w http.ResponseWriter, r *http.Request) {
 		// A text-based PDF was extracted. Scanned pages are rejected by Extract with a clear message.
 	}
 
-	products, err := a.requestCatalog()
+	dishes, err := a.menuDishes()
 	if err != nil {
-		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить каталог товаров")
+		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить меню")
 		return
 	}
-	preview := make([]requestPreviewItem, 0, len(document.Items))
+	menu := make([]string, len(dishes))
+	for i, dish := range dishes {
+		menu[i] = dish.Name
+	}
+	names := make([]string, 0, len(document.Items))
 	for _, item := range document.Items {
+		names = append(names, item.ProductName)
+	}
+	// Поиск по смыслу: «Салат из помидоров» → «Салат с томатами»; чего нет в меню — помечается.
+	matches := a.matchNames(ctx, names, menu, "dish")
+	preview := make([]requestPreviewItem, 0, len(document.Items))
+	notInMenu := make(map[string]bool)
+	for _, item := range document.Items {
+		portions := int64(math.Ceil(item.Quantity))
+		if portions < 1 {
+			portions = 1
+		}
 		row := requestPreviewItem{
 			OriginalName: strings.TrimSpace(item.ProductName),
-			ProductName:  strings.TrimSpace(item.ProductName),
-			Quantity:     item.Quantity,
-			Unit:         requestimport.NormalizeUnit(item.Unit),
+			DishName:     strings.TrimSpace(item.ProductName),
+			Portions:     portions,
 			Confidence:   item.Confidence,
 		}
-		product, matched := matchRequestProduct(item.ProductName, products)
-		row.CatalogMatch = matched
-		if matched {
-			fromUnit := requestimport.NormalizeUnit(item.Unit)
-			if fromUnit == "" {
-				fromUnit = product.Unit
-			}
-			quantity, convertible := requestimport.ConvertQuantity(item.Quantity, fromUnit, product.Unit)
-			if convertible {
-				row.ProductID = strconv.FormatInt(product.ID, 10)
-				row.ProductName = product.Name
-				row.Quantity = quantity
-				row.Unit = product.Unit
-				row.UnitPriceKopecks = product.BasePriceKopecks
-				row.PriceConfigured = product.PriceConfigured
-				row.Available = product.Available
-				if product.Available <= 0 {
-					warnings = append(warnings, fmt.Sprintf("Товар «%s» найден в каталоге, но доступного остатка на складе нет.", product.Name))
-				}
-			} else {
-				row.UnitMismatch = true
-				row.Available = product.Available
-				warnings = append(warnings, fmt.Sprintf("Товар «%s» найден, но единица «%s» не совпадает с единицей каталога «%s». Выбери товар/единицу вручную.", item.ProductName, item.Unit, product.Unit))
-			}
+		if index, ok := matches[item.ProductName]; ok {
+			dish := dishes[index]
+			row.CatalogMatch = true
+			row.DishID = dish.DishID
+			row.DishName = dish.Name
+			row.AvailablePortions = dish.AvailablePortions
+			row.UnitPriceKopecks = dish.PriceKopecks
+			row.PriceConfigured = dish.PriceConfigured
 		} else {
-			warnings = append(warnings, fmt.Sprintf("Товара «%s» нет в каталоге и на складе. Добавь его через раздел «Поставки» или выбери замену из списка.", item.ProductName))
-		}
-		if row.Unit == "" {
-			row.Unit = "pcs"
+			notInMenu[row.OriginalName] = true
 		}
 		preview = append(preview, row)
 	}
-	if document.CustomerName == "" {
-		document.CustomerName = ""
+	if len(notInMenu) > 0 {
+		warnings = append(warnings, "Этих блюд нет в меню: "+strings.Join(requestimport.SortedKeys(notInMenu), ", ")+". Выберите замену из меню или удалите строку.")
 	}
 	duplicate := false
 	if err := a.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM customer_requests WHERE source_sha256=?)", hashHex).Scan(&duplicate); err != nil {
@@ -331,7 +336,7 @@ func (a *API) ParseRequestFile(w http.ResponseWriter, r *http.Request) {
 	a.sendJSON(w, http.StatusOK, parsedRequestResponse{
 		CustomerName: strings.TrimSpace(document.CustomerName), SourceFilename: filename, SourceHash: hashHex,
 		AIUsed: aiUsed, DuplicateSaved: duplicate, Items: preview, Warnings: uniqueStrings(warnings),
-		Catalog: catalogDTO(products), ParserMode: parserMode,
+		Catalog: dishes, ParserMode: parserMode,
 	})
 }
 
@@ -430,6 +435,58 @@ func (a *API) UpdateProductPrice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// UpdateDishPrice задаёт цену порции блюда — по ней считаются заявки на банкеты.
+func (a *API) UpdateDishPrice(w http.ResponseWriter, r *http.Request) {
+	dishID, err := parseID(r.PathValue("id"))
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, "Некорректный идентификатор блюда")
+		return
+	}
+	var input struct {
+		PriceKopecks int64 `json:"priceKopecks"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		a.writeError(w, http.StatusBadRequest, "Передай цену в копейках")
+		return
+	}
+	if input.PriceKopecks < 0 || input.PriceKopecks > 1000000000000 {
+		a.writeError(w, http.StatusBadRequest, "Цена должна быть от 0 до 10 000 000 000 ₽")
+		return
+	}
+	result, err := a.DB.Exec("UPDATE dishes SET price_kopecks=? WHERE id=?", input.PriceKopecks, dishID)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "Не удалось обновить цену")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		a.writeError(w, http.StatusNotFound, "Блюдо не найдено")
+		return
+	}
+	a.bumpRev()
+	a.sendJSON(w, http.StatusOK, map[string]any{
+		"id": strconv.FormatInt(dishID, 10), "priceKopecks": input.PriceKopecks, "priceConfigured": true,
+	})
+}
+
+// dishNames — названия блюд меню.
+func (a *API) dishNames() []string {
+	requestMu.Lock()
+	defer requestMu.Unlock()
+	rows, err := a.DB.Query("SELECT name FROM dishes ORDER BY name COLLATE NOCASE")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	names := make([]string, 0)
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) == nil {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
 func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	var input createRequestInput
 	if err := decodeJSON(w, r, &input); err != nil {
@@ -458,7 +515,7 @@ func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(input.Items) == 0 || len(input.Items) > 500 {
-		a.writeError(w, http.StatusBadRequest, "Добавь от 1 до 500 товарных позиций")
+		a.writeError(w, http.StatusBadRequest, "Добавь от 1 до 500 блюд")
 		return
 	}
 	if input.SourceHash != "" {
@@ -507,13 +564,13 @@ func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	var subtotalTotal int64
 	var grandTotal int64
 	for _, item := range input.Items {
-		productID, err := parseID(item.ProductID)
+		dishID, err := parseID(item.DishID)
 		if err != nil {
-			a.writeError(w, http.StatusBadRequest, "Для каждой строки выбери товар из каталога")
+			a.writeError(w, http.StatusBadRequest, "Для каждой строки выбери блюдо из меню")
 			return
 		}
-		if math.IsNaN(item.Quantity) || math.IsInf(item.Quantity, 0) || item.Quantity <= 0 || item.Quantity > 1e9 {
-			a.writeError(w, http.StatusBadRequest, "Количество товара должно быть положительным числом")
+		if item.Portions <= 0 || item.Portions > 100000 {
+			a.writeError(w, http.StatusBadRequest, "Число порций должно быть от 1 до 100 000")
 			return
 		}
 		if item.ItemDiscountPercent < 0 || item.ItemDiscountPercent > 100 {
@@ -521,23 +578,23 @@ func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		var productName, unit string
+		var dishName string
 		var price sql.NullInt64
-		if err := tx.QueryRow("SELECT name,unit,base_price_kopecks FROM products WHERE id=?", productID).Scan(&productName, &unit, &price); err != nil {
+		if err := tx.QueryRow("SELECT name,price_kopecks FROM dishes WHERE id=?", dishID).Scan(&dishName, &price); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				a.writeError(w, http.StatusBadRequest, "Один из выбранных товаров больше не существует")
+				a.writeError(w, http.StatusBadRequest, "Одно из выбранных блюд больше нет в меню")
 			} else {
-				a.writeError(w, http.StatusInternalServerError, "Не удалось проверить каталог товаров")
+				a.writeError(w, http.StatusInternalServerError, "Не удалось проверить меню")
 			}
 			return
 		}
 		var unitPriceKopecks int64
 		if price.Valid {
-			// A configured catalogue price always wins over any browser-provided value.
+			// Цена порции из меню всегда важнее цены, присланной браузером.
 			unitPriceKopecks = price.Int64
 		} else {
 			if item.UnitPriceKopecks == nil {
-				a.writeError(w, http.StatusBadRequest, "Для товара «"+productName+"» нет цены в БД. Введи цену вручную в строке заявки.")
+				a.writeError(w, http.StatusBadRequest, "Для блюда «"+dishName+"» не задана цена порции. Введи цену вручную в строке заявки.")
 				return
 			}
 			if *item.UnitPriceKopecks < 0 || *item.UnitPriceKopecks > 1000000000000 {
@@ -546,7 +603,7 @@ func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 			}
 			unitPriceKopecks = *item.UnitPriceKopecks
 		}
-		lineSubtotal := int64(math.Round(float64(unitPriceKopecks) * item.Quantity))
+		lineSubtotal := unitPriceKopecks * item.Portions
 		lineTotal := int64(math.Round(float64(lineSubtotal) * (1 - float64(item.ItemDiscountPercent)/100) * (1 - float64(input.GlobalDiscountPercent)/100)))
 		if lineSubtotal < 0 || lineTotal < 0 {
 			a.writeError(w, http.StatusBadRequest, "Не удалось рассчитать стоимость позиции")
@@ -555,11 +612,11 @@ func (a *API) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		subtotalTotal += lineSubtotal
 		grandTotal += lineTotal
 		_, err = tx.Exec(
-			"INSERT INTO customer_request_items(request_id,product_id,product_name,unit,quantity,unit_price_kopecks,item_discount_percent,subtotal_kopecks,total_kopecks) VALUES(?,?,?,?,?,?,?,?,?)",
-			requestID, productID, productName, unit, item.Quantity, unitPriceKopecks, item.ItemDiscountPercent, lineSubtotal, lineTotal,
+			"INSERT INTO customer_request_items(request_id,dish_id,dish_name,portions,unit_price_kopecks,item_discount_percent,subtotal_kopecks,total_kopecks) VALUES(?,?,?,?,?,?,?,?)",
+			requestID, dishID, dishName, item.Portions, unitPriceKopecks, item.ItemDiscountPercent, lineSubtotal, lineTotal,
 		)
 		if err != nil {
-			a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить товарную позицию")
+			a.writeError(w, http.StatusInternalServerError, "Не удалось сохранить позицию заявки")
 			return
 		}
 	}
@@ -654,7 +711,7 @@ func (a *API) loadSavedRequest(id int64) (savedRequest, error) {
 	item.TotalKopecks = total
 	item.DiscountKopecks = subtotal - total
 	rows, err := a.DB.Query(
-		"SELECT product_id,product_name,unit,quantity,unit_price_kopecks,item_discount_percent,subtotal_kopecks,total_kopecks FROM customer_request_items WHERE request_id=? ORDER BY id",
+		"SELECT dish_id,dish_name,portions,unit_price_kopecks,item_discount_percent,subtotal_kopecks,total_kopecks FROM customer_request_items WHERE request_id=? ORDER BY id",
 		id,
 	)
 	if err != nil {
@@ -663,12 +720,12 @@ func (a *API) loadSavedRequest(id int64) (savedRequest, error) {
 	item.Items = make([]savedRequestItem, 0)
 	for rows.Next() {
 		var line savedRequestItem
-		var productID int64
-		if err := rows.Scan(&productID, &line.ProductName, &line.Unit, &line.Quantity, &line.UnitPriceKopecks, &line.ItemDiscountPercent, &line.SubtotalKopecks, &line.TotalKopecks); err != nil {
+		var dishID int64
+		if err := rows.Scan(&dishID, &line.DishName, &line.Portions, &line.UnitPriceKopecks, &line.ItemDiscountPercent, &line.SubtotalKopecks, &line.TotalKopecks); err != nil {
 			rows.Close()
 			return item, err
 		}
-		line.ProductID = strconv.FormatInt(productID, 10)
+		line.DishID = strconv.FormatInt(dishID, 10)
 		item.Items = append(item.Items, line)
 	}
 	if err := rows.Err(); err != nil {

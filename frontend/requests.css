@@ -189,3 +189,10 @@
 .request-product-cell .request-original-name:first-child {
   color:var(--ink-faint);
 }
+
+/* Хватит ли продуктов на все порции заявки */
+.request-stock { margin-top: 16px; padding: 14px 16px; border-radius: 12px; display: grid; gap: 8px; font-size: 13.5px; line-height: 1.5; color: var(--ink-soft); }
+.request-stock strong { color: var(--ink); font-weight: 500; }
+.request-stock ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; color: var(--ink); }
+.request-stock.is-ok { background: rgba(98, 210, 140, 0.08); border: 1px solid rgba(98, 210, 140, 0.35); }
+.request-stock.is-short { background: rgba(242, 194, 75, 0.08); border: 1px solid rgba(242, 194, 75, 0.4); }

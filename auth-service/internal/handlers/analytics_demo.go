@@ -25,6 +25,25 @@ func (a *API) latestAlerts(limit int) ([]contract.Alert, error) {
 	if limit < 1 {
 		limit = 5
 	}
+	// Ленту уведомлений спрашивает опрос каждой страницы раз в 3 секунды — она кэшируется
+	// в Redis до следующего изменения данных (новое уведомление всегда меняет ревизию).
+	cacheKey := "alerts:" + strconv.Itoa(limit) + ":" + strconv.FormatInt(a.currentRev(), 10)
+	if cached, ok := a.KV.Get(cacheKey); ok {
+		var alerts []contract.Alert
+		if json.Unmarshal([]byte(cached), &alerts) == nil {
+			return alerts, nil
+		}
+	}
+	alerts, err := a.queryAlerts(limit)
+	if err == nil {
+		if encoded, encodeErr := json.Marshal(alerts); encodeErr == nil {
+			a.KV.Set(cacheKey, string(encoded), 30*time.Second)
+		}
+	}
+	return alerts, err
+}
+
+func (a *API) queryAlerts(limit int) ([]contract.Alert, error) {
 	rows, err := a.DB.Query("SELECT id,at,level,text FROM alerts ORDER BY id DESC LIMIT ?", limit)
 	if err != nil {
 		return nil, err

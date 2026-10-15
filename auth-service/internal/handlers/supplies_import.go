@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"auth-service/internal/contract"
 	"auth-service/internal/requestimport"
 	"context"
 	"crypto/rand"
@@ -143,21 +144,44 @@ func (a *API) ParseSupplyFile(w http.ResponseWriter, r *http.Request) {
 	}
 	hash := sha256.Sum256(data)
 	hashHex := hex.EncodeToString(hash[:])
-	baseURL, model := requestimport.OllamaConfig()
-
 	log.Printf(
-		"Импорт поставки: файл=%s, размер=%d байт, текст=%d символов, изображение=%d байт, модель=%s",
-		filename, len(data), len([]rune(source.Text)), len(source.Image), model,
+		"Импорт поставки: файл=%s, размер=%d байт, текст=%d символов, изображение=%d байт",
+		filename, len(data), len([]rune(source.Text)), len(source.Image),
 	)
 
+	// Простые таблицы (в том числе шаблон) разбираются сразу, всё остальное — через очередь Qwen.
+	if isPlainTable(filename, source) {
+		if document := requestimport.FallbackSupply(source.Text); len(document.Items) > 0 {
+			names := make([]string, 0, len(document.Items))
+			for _, item := range document.Items {
+				names = append(names, item.ProductName)
+			}
+			if !needsModelMatch(names, a.productNames()) {
+				a.finishSupplyParse(r.Context(), w, filename, hashHex, source)
+				return
+			}
+		}
+	}
+	a.enqueueDocument(w, "supply", filename, hashHex, source)
+}
+
+// isPlainTable — текстовый файл, который можно разобрать без модели.
+func isPlainTable(filename string, source requestimport.Source) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	return source.Text != "" && (ext == ".txt" || ext == ".csv" || ext == ".tsv" || ext == ".md" || ext == ".log")
+}
+
+// finishSupplyParse распознаёт накладную, сопоставляет строки с каталогом и пишет журнал
+// supply_imports. Вызывается из запроса (простые таблицы) или из очереди документов.
+func (a *API) finishSupplyParse(ctx context.Context, w http.ResponseWriter, filename, hashHex string, source requestimport.Source) {
+	baseURL, model := requestimport.OllamaConfig()
 	warnings := make([]string, 0)
 	var document requestimport.SupplyDocument
 	aiUsed := false
 	parserMode := "ai"
 
 	// Simple text tables (including the CSV template) are read without waiting for the model.
-	ext := strings.ToLower(filepath.Ext(filename))
-	if source.Text != "" && (ext == ".txt" || ext == ".csv" || ext == ".tsv" || ext == ".md" || ext == ".log") {
+	if isPlainTable(filename, source) {
 		if candidate := requestimport.FallbackSupply(source.Text); len(candidate.Items) > 0 {
 			document = candidate
 			parserMode = "structured"
@@ -165,11 +189,11 @@ func (a *API) ParseSupplyFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if parserMode != "structured" {
-		// nginx closes the proxied request after 60 s, so the model gets a little less.
-		ctx, cancel := context.WithTimeout(r.Context(), 52*time.Second)
+		// Распознавание идёт в очереди документов, поэтому модели даётся общий срок задачи.
+		aiCtx, cancel := context.WithTimeout(ctx, jobTimeout)
 		started := time.Now()
 		var aiErr error
-		document, aiErr = requestimport.AnalyzeSupply(ctx, source, baseURL, model)
+		document, aiErr = requestimport.AnalyzeSupply(aiCtx, source, baseURL, model)
 		cancel()
 		log.Printf("Анализ поставки Ollama завершён: время=%s, ошибка=%v", time.Since(started), aiErr)
 
@@ -191,13 +215,28 @@ func (a *API) ParseSupplyFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestMu.Lock()
-	defer requestMu.Unlock()
-
 	products, err := a.requestCatalog()
+	requestMu.Unlock()
 	if err != nil {
 		a.writeError(w, http.StatusInternalServerError, "Не удалось загрузить каталог продуктов")
 		return
 	}
+	// Позиции сопоставляются с продуктами склада по смыслу («Помидоры свежие» → «Томаты»).
+	// Если склад пустой (первая поставка), всё заводится как новое; иначе то, чему нет пары
+	// на складе, в поставку не попадает — об этом сообщается отдельно.
+	names := make([]string, 0, len(document.Items))
+	for _, item := range document.Items {
+		names = append(names, item.ProductName)
+	}
+	catalog := make([]string, len(products))
+	for i, product := range products {
+		catalog[i] = product.Name
+	}
+	matches := a.matchNames(ctx, names, catalog, "product")
+	skipped := make(map[string]bool)
+
+	requestMu.Lock()
+	defer requestMu.Unlock()
 
 	items := make([]supplyPreviewItem, 0, len(document.Items))
 	// One supply cannot hold the same product twice, so repeated rows are merged.
@@ -209,16 +248,14 @@ func (a *API) ParseSupplyFile(w http.ResponseWriter, r *http.Request) {
 			Name:         strings.TrimSpace(raw.ProductName),
 			Confidence:   raw.Confidence,
 		}
-		// Only an exact name match is used: a supply may create a new product, and
-		// "Сливки 10 %" must not be merged into an existing "Сливки 33 %".
 		productUnit := ""
-		for _, product := range products {
-			if normalizeRequestName(product.Name) == normalizeRequestName(raw.ProductName) {
-				row.Name = product.Name
-				row.CatalogMatch = true
-				productUnit = product.Unit
-				break
-			}
+		if index, ok := matches[raw.ProductName]; ok {
+			row.Name = products[index].Name
+			row.CatalogMatch = true
+			productUnit = products[index].Unit
+		} else if len(products) > 0 {
+			skipped[row.OriginalName] = true
+			continue
 		}
 		quantity, unit, convertible := supplyQuantity(raw.Quantity, raw.Unit, productUnit)
 		if !convertible {
@@ -257,7 +294,11 @@ func (a *API) ParseSupplyFile(w http.ResponseWriter, r *http.Request) {
 	if generatedShelf > 0 {
 		warnings = append(warnings, fmt.Sprintf("Срок хранения не указан в документе для позиций: %d. Подставлен случайный срок от %d до %d ч — проверьте его.", generatedShelf, randomShelfLifeMin, randomShelfLifeMax))
 	}
-	if len(items) == 0 {
+	if len(skipped) > 0 {
+		warnings = append(warnings, fmt.Sprintf("Не добавлено — этих продуктов нет на складе (%d из %d): %s. Их можно добавить вручную строкой в таблице.",
+			len(skipped), len(document.Items), strings.Join(requestimport.SortedKeys(skipped), ", ")))
+	}
+	if len(items) == 0 && len(skipped) == 0 {
 		warnings = append(warnings, "Не удалось уверенно выделить позиции. Их можно добавить вручную.")
 	}
 	// POST /supplies accepts numbers up to 80 bytes.
@@ -308,4 +349,99 @@ func (a *API) ParseSupplyFile(w http.ResponseWriter, r *http.Request) {
 		SourceFilename: filename, SourceHash: hashHex, AIUsed: aiUsed, ParserMode: parserMode,
 		DuplicateSaved: duplicate, Items: items, Warnings: warnings,
 	})
+}
+
+// matchNames сопоставляет названия из документа со списком (продукты склада или блюда меню):
+// сначала правила (синонимы, формы слов, «свежие» и жирность не важны), затем Qwen для
+// оставшихся с повторной проверкой каждой пары. Возвращает индекс в catalog.
+func (a *API) matchNames(ctx context.Context, names, catalog []string, kind string) map[string]int {
+	result := make(map[string]int)
+	if len(catalog) == 0 {
+		return result
+	}
+	index := make(map[string]int, len(catalog))
+	for i, name := range catalog {
+		index[name] = i
+	}
+	unmatched := make([]string, 0)
+	asked := make(map[string]bool)
+	for _, name := range names {
+		if i, ok := requestimport.MatchByRules(name, catalog); ok {
+			result[name] = i
+		} else if !asked[name] {
+			asked[name] = true
+			unmatched = append(unmatched, name)
+		}
+	}
+	if len(unmatched) == 0 {
+		return result
+	}
+	baseURL, model := requestimport.OllamaConfig()
+	modelCtx, cancel := context.WithTimeout(ctx, jobTimeout)
+	defer cancel()
+	found, err := requestimport.MatchWithModel(modelCtx, unmatched, catalog, kind, baseURL, model)
+	log.Printf("Сопоставление (%s): правилами %d, Qwen из %d нашла %d, ошибка=%v", kind, len(result), len(unmatched), len(found), err)
+	for name, match := range found {
+		result[name] = index[match]
+	}
+	return result
+}
+
+// needsModelMatch — есть ли названия, для которых правила не нашли пару (тогда документ
+// идёт в очередь: ответ Qwen может занять дольше, чем держит nginx).
+func needsModelMatch(names, catalog []string) bool {
+	if len(catalog) == 0 {
+		return false
+	}
+	for _, name := range names {
+		if _, ok := requestimport.MatchByRules(name, catalog); !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// productNames — названия продуктов склада.
+func (a *API) productNames() []string {
+	requestMu.Lock()
+	products, err := a.requestCatalog()
+	requestMu.Unlock()
+	if err != nil {
+		return nil
+	}
+	names := make([]string, len(products))
+	for i, product := range products {
+		names[i] = product.Name
+	}
+	return names
+}
+
+// menuDishes — блюда меню с ценой порции и числом порций, которые можно приготовить сейчас.
+func (a *API) menuDishes() ([]contract.Dish, error) {
+	requestMu.Lock()
+	defer requestMu.Unlock()
+	now, _ := a.nowAndSpeed()
+	rows, err := a.DB.Query("SELECT id FROM dishes ORDER BY name COLLATE NOCASE,id")
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	dishes := make([]contract.Dish, 0, len(ids))
+	for _, id := range ids {
+		dish, err := a.buildDish(id, now)
+		if err != nil {
+			return nil, err
+		}
+		dishes = append(dishes, dish)
+	}
+	return dishes, nil
 }
