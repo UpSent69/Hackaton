@@ -9,6 +9,22 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Open подключается к общей базе без миграций — для ai-service и notification-service:
+// схему создаёт и обновляет только core (Init), чтобы сервисы не мигрировали её одновременно.
+func Open(dbPath string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure sqlite: %w", err)
+	}
+	return db, db.Ping()
+}
+
 // Init prepares the SQLite schema. Existing legacy auth tables are kept so an old
 // local database can be migrated without losing its administrator accounts.
 func Init(dbPath string) (*sql.DB, error) {

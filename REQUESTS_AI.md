@@ -62,10 +62,10 @@ JWT_SECRET=replace-this-with-a-random-secret-at-least-32-characters
 docker compose up --build -d
 ~~~~
 
-В docker-compose.yml backend по умолчанию использует Windows Ollama по адресу `http://host.docker.internal:11434`. Переменные OLLAMA_URL и OLLAMA_MODEL можно переопределить в .env. Для проверки сначала выполни `Invoke-RestMethod http://localhost:11434/api/tags` на Windows, затем проверь доступ из контейнера:
+В docker-compose.yml ai-service (он распознаёт файлы и считает аналитику) по умолчанию использует Windows Ollama по адресу `http://host.docker.internal:11434`. Переменные OLLAMA_URL и OLLAMA_MODEL можно переопределить в .env. Для проверки сначала выполни `Invoke-RestMethod http://localhost:11434/api/tags` на Windows, затем проверь доступ из контейнера:
 
 ~~~~powershell
-docker compose exec backend sh -c 'echo "$OLLAMA_URL $OLLAMA_MODEL"; wget -qO- "$OLLAMA_URL/api/tags"'
+docker compose exec ai-service sh -c 'echo "$OLLAMA_URL $OLLAMA_MODEL"; wget -qO- "$OLLAMA_URL/api/tags"'
 ~~~~
 
 Ответ со списком моделей должен содержать `qwen3.5:2b`. Если команда в контейнере не проходит, проверь `OLLAMA_HOST` и правила брандмауэра Windows. Альтернативный, отдельный Ollama-контейнер включается явно через `docker compose --profile container-ollama up -d`; в этом случае модель потребуется отдельно скачать внутри него.

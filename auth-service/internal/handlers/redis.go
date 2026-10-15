@@ -18,7 +18,7 @@ import (
 
 // KV — Redis рядом с SQLite. В SQLite лежат основные данные склада, в Redis — временные:
 // сессии, кэш ответов, счётчик изменений, ограничение частоты запросов, состояние анализа
-// Qwen и очередь распознавания документов.
+// Qwen и результаты распознавания документов (сама очередь задач — в Kafka).
 //
 // Redis необязателен: если он недоступен, каждый вызов сразу возвращает «нет», и код идёт
 // запасным путём (SQLite или память процесса). Раз в 3 секунды соединение проверяется;
@@ -157,32 +157,6 @@ func (kv *KV) SMembers(key string) []string {
 	members, err := kv.client.SMembers(ctx, key).Result()
 	kv.fail(err)
 	return members
-}
-
-func (kv *KV) RPush(key, value string) bool {
-	if !kv.Ready() {
-		return false
-	}
-	ctx, cancel := kv.ctx()
-	defer cancel()
-	err := kv.client.RPush(ctx, key, value).Err()
-	kv.fail(err)
-	return err == nil
-}
-
-// BLPop ждёт элемент очереди не дольше wait.
-func (kv *KV) BLPop(key string, wait time.Duration) (string, bool) {
-	if !kv.Ready() {
-		return "", false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), wait+time.Second)
-	defer cancel()
-	values, err := kv.client.BLPop(ctx, wait, key).Result()
-	kv.fail(err)
-	if err != nil || len(values) != 2 {
-		return "", false
-	}
-	return values[1], true
 }
 
 /* ---------- Ограничение частоты запросов ---------- */

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"auth-service/internal/events"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -9,7 +10,12 @@ import (
 // API contains the shared dependencies used by the HTTP handlers.
 type API struct {
 	DB *sql.DB
-	KV *KV // Redis: сессии, кэш, ревизия, ограничение частоты, очередь документов (может быть недоступен)
+	KV  *KV         // Redis: сессии, кэш, ревизия, ограничение частоты (может быть недоступен)
+	Bus *events.Bus // Kafka: распознавание документов, аналитика Qwen, события склада
+
+	// NoMaintenance — сервис не обслуживает склад (ai-service, notification-service):
+	// пересчёт статусов партий и стоп-листа на каждом запросе делает только core.
+	NoMaintenance bool
 }
 
 var jwtSecret []byte

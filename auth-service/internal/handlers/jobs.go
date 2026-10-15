@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"auth-service/internal/events"
 	"auth-service/internal/requestimport"
 	"context"
 	"crypto/rand"
@@ -15,15 +16,14 @@ import (
 
 // Очередь распознавания документов (накладные во вкладке «Поставки», заявки во вкладке
 // «Заявка»). Распознавание через Qwen может занять больше минуты, а nginx держит запрос
-// не дольше 60 секунд, поэтому файл ставится в очередь: маршрут сразу отвечает 202 с номером
-// задачи, фоновый обработчик распознаёт документ, а страница забирает результат через
-// GET /api/jobs/{id}. Задачи и результаты хранятся в Redis (переживают перезапуск сервера),
-// без Redis — в памяти процесса. Обработчик один: Ollama всё равно отвечает по очереди.
+// не дольше 60 секунд, поэтому core сразу отвечает 202 с номером задачи и публикует документ
+// в Kafka (documents.parse). ai-service распознаёт его и публикует результат
+// (documents.results), core сохраняет результат в Redis (без Redis — в памяти), а страница
+// забирает его через GET /api/jobs/{id}.
 
 const (
-	jobQueueKey = "jobs:documents"
-	jobTTL      = time.Hour
-	jobTimeout  = 3 * time.Minute
+	jobTTL     = time.Hour
+	jobTimeout = 3 * time.Minute
 )
 
 type documentJob struct {
@@ -41,15 +41,18 @@ type jobResult struct {
 	Body   json.RawMessage `json:"body"`
 }
 
-// Запасное хранилище задач, пока Redis недоступен.
+type documentResult struct {
+	JobID string `json:"jobId"`
+	jobResult
+}
+
+// Запасное хранилище задач core, пока Redis недоступен.
 var (
-	memoryJobsMu    sync.Mutex
-	memoryJobs      = make(map[string]*memoryJob)
-	memoryJobsQueue = make(chan string, 200)
+	memoryJobsMu sync.Mutex
+	memoryJobs   = make(map[string]*memoryJob)
 )
 
 type memoryJob struct {
-	job    documentJob
 	result *jobResult
 	at     time.Time
 }
@@ -60,26 +63,21 @@ func newJobID() string {
 	return hex.EncodeToString(buf)
 }
 
-// enqueueDocument ставит документ в очередь и отвечает 202 с номером задачи.
+// enqueueDocument публикует документ в Kafka и отвечает 202 с номером задачи.
 func (a *API) enqueueDocument(w http.ResponseWriter, kind, filename, hash string, source requestimport.Source) {
 	job := documentJob{ID: newJobID(), Kind: kind, Filename: filename, Hash: hash, Text: source.Text, Image: source.Image, MIME: source.ImageMIME}
-	encoded, err := json.Marshal(job)
-	if err != nil {
-		a.writeError(w, http.StatusInternalServerError, "Не удалось поставить документ в очередь")
+	if err := a.Bus.Publish(context.Background(), events.TopicDocumentJobs, job.ID, job); err != nil {
+		log.Printf("Очередь документов: Kafka недоступна: %v", err)
+		a.writeError(w, http.StatusServiceUnavailable, "Сервис распознавания временно недоступен, попробуйте через минуту")
 		return
 	}
-	if !(a.KV.Set("job:"+job.ID, string(encoded), jobTTL) && a.KV.RPush(jobQueueKey, job.ID)) {
+	// Отметка «задача есть» — чтобы GET /api/jobs/{id} отвечал 202, а не 404.
+	if !a.KV.Set("job:"+job.ID, "pending", jobTTL) {
 		memoryJobsMu.Lock()
-		memoryJobs[job.ID] = &memoryJob{job: job, at: time.Now()}
+		memoryJobs[job.ID] = &memoryJob{at: time.Now()}
 		memoryJobsMu.Unlock()
-		select {
-		case memoryJobsQueue <- job.ID:
-		default:
-			a.writeError(w, http.StatusServiceUnavailable, "Очередь распознавания переполнена, попробуйте через минуту")
-			return
-		}
 	}
-	log.Printf("Очередь документов: задача %s (%s, %s) поставлена", job.ID, kind, filename)
+	log.Printf("Очередь документов: задача %s (%s, %s) отправлена в Kafka", job.ID, kind, filename)
 	a.sendJSON(w, http.StatusAccepted, map[string]string{"status": "pending", "jobId": job.ID})
 }
 
@@ -94,13 +92,13 @@ func (a *API) Job(w http.ResponseWriter, r *http.Request) {
 	}
 	memoryJobsMu.Unlock()
 
-	if entry == nil {
+	if result == nil {
 		if raw, ok := a.KV.Get("job:" + id + ":result"); ok {
 			result = &jobResult{}
 			if json.Unmarshal([]byte(raw), result) != nil {
 				result = nil
 			}
-		} else if _, ok := a.KV.Get("job:" + id); !ok {
+		} else if _, ok := a.KV.Get("job:" + id); !ok && entry == nil {
 			a.writeError(w, http.StatusNotFound, "Задача не найдена или устарела — загрузите файл заново")
 			return
 		}
@@ -114,57 +112,31 @@ func (a *API) Job(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(result.Body)
 }
 
-// startDocumentWorker запускает фоновый обработчик очереди.
-func (a *API) startDocumentWorker() {
-	go func() {
-		for {
-			if id, ok := a.nextJob(); ok {
-				a.runJob(id)
-			}
-		}
-	}()
-	go func() { // устаревшие задачи из памяти удаляются через час
-		for range time.Tick(10 * time.Minute) {
-			memoryJobsMu.Lock()
-			for id, entry := range memoryJobs {
-				if time.Since(entry.at) > jobTTL {
-					delete(memoryJobs, id)
-				}
-			}
-			memoryJobsMu.Unlock()
-		}
-	}()
-}
-
-func (a *API) nextJob() (string, bool) {
-	select {
-	case id := <-memoryJobsQueue:
-		return id, true
-	default:
-	}
-	if a.KV.Ready() {
-		return a.KV.BLPop(jobQueueKey, 2*time.Second)
-	}
-	select {
-	case id := <-memoryJobsQueue:
-		return id, true
-	case <-time.After(2 * time.Second):
-		return "", false
-	}
-}
-
-func (a *API) runJob(id string) {
-	memoryJobsMu.Lock()
-	entry := memoryJobs[id]
-	memoryJobsMu.Unlock()
-	var job documentJob
-	if entry != nil {
-		job = entry.job
-	} else if raw, ok := a.KV.Get("job:" + id); !ok || json.Unmarshal([]byte(raw), &job) != nil {
-		log.Printf("Очередь документов: задача %s не найдена", id)
+// storeDocumentResult (core) сохраняет результат из documents.results для GET /api/jobs/{id}.
+func (a *API) storeDocumentResult(value []byte) {
+	var message documentResult
+	if err := json.Unmarshal(value, &message); err != nil || message.JobID == "" {
+		log.Printf("Очередь документов: непонятный результат: %v", err)
 		return
 	}
+	result := message.jobResult
+	encoded, _ := json.Marshal(result)
+	memoryJobsMu.Lock()
+	defer memoryJobsMu.Unlock()
+	if entry := memoryJobs[message.JobID]; entry != nil || !a.KV.Set("job:"+message.JobID+":result", string(encoded), jobTTL) {
+		memoryJobs[message.JobID] = &memoryJob{result: &result, at: time.Now()}
+	}
+	log.Printf("Очередь документов: результат задачи %s получен, HTTP %d", message.JobID, result.Status)
+}
 
+// processDocument (ai-service) распознаёт документ из documents.parse и публикует результат.
+// Обработчик один: Ollama всё равно отвечает по очереди.
+func (a *API) processDocument(value []byte) {
+	var job documentJob
+	if err := json.Unmarshal(value, &job); err != nil || job.ID == "" {
+		log.Printf("Распознавание: непонятная задача: %v", err)
+		return
+	}
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), jobTimeout)
 	defer cancel()
@@ -175,20 +147,22 @@ func (a *API) runJob(id string) {
 	} else {
 		a.finishRequestParse(ctx, recorder, job.Filename, job.Hash, source)
 	}
-	result := jobResult{Status: recorder.Code, Body: json.RawMessage(recorder.Body.Bytes())}
-	log.Printf("Очередь документов: задача %s готова за %s, HTTP %d", id, time.Since(started).Round(time.Second), result.Status)
-
-	if entry != nil {
-		memoryJobsMu.Lock()
-		entry.result = &result
-		memoryJobsMu.Unlock()
-		return
+	result := documentResult{JobID: job.ID, jobResult: jobResult{Status: recorder.Code, Body: json.RawMessage(recorder.Body.Bytes())}}
+	log.Printf("Распознавание: задача %s (%s) готова за %s, HTTP %d", job.ID, job.Kind, time.Since(started).Round(time.Second), result.Status)
+	if err := a.Bus.Publish(context.Background(), events.TopicDocumentResults, job.ID, result); err != nil {
+		log.Printf("Распознавание: не удалось отправить результат задачи %s: %v", job.ID, err)
 	}
-	encoded, _ := json.Marshal(result)
-	if !a.KV.Set("job:"+id+":result", string(encoded), jobTTL) {
-		// Redis пропал во время распознавания — результат сохраняется в памяти.
+}
+
+// cleanupMemoryJobs удаляет из памяти core устаревшие задачи.
+func cleanupMemoryJobs() {
+	for range time.Tick(10 * time.Minute) {
 		memoryJobsMu.Lock()
-		memoryJobs[id] = &memoryJob{job: job, result: &result, at: time.Now()}
+		for id, entry := range memoryJobs {
+			if time.Since(entry.at) > jobTTL {
+				delete(memoryJobs, id)
+			}
+		}
 		memoryJobsMu.Unlock()
 	}
 }

@@ -2,7 +2,10 @@ package handlers
 
 import (
 	"auth-service/internal/contract"
+	"auth-service/internal/events"
 	"database/sql"
+	"encoding/json"
+	"log"
 	"fmt"
 	"math"
 	"net/http"
@@ -90,8 +93,38 @@ func (a *API) loadBatchRows(where string, args ...interface{}) ([]batchRow, erro
 	return result, nil
 }
 
+// warehouseEvent — событие склада (core → notification-service): из него строится уведомление.
+type warehouseEvent struct {
+	Level string    `json:"level"`
+	Text  string    `json:"text"`
+	At    time.Time `json:"at"`
+}
+
+// addAlert публикует событие склада в Kafka; уведомление записывает notification-service.
+// Без Kafka (локальный запуск без KAFKA_BROKERS) уведомление пишется сразу.
 func (a *API) addAlert(level contract.AlertLevel, text string, at time.Time) {
-	_, _ = a.DB.Exec("INSERT INTO alerts(at,level,text) VALUES(?,?,?)", formatTime(at), string(level), text)
+	event := warehouseEvent{Level: string(level), Text: text, At: at}
+	if a.Bus.Enabled() {
+		a.Bus.PublishAsync(events.TopicWarehouseEvents, string(level), event)
+		return
+	}
+	a.insertAlert(event)
+}
+
+func (a *API) insertAlert(event warehouseEvent) {
+	_, _ = a.DB.Exec("INSERT INTO alerts(at,level,text) VALUES(?,?,?)", formatTime(event.At), event.Level, event.Text)
+}
+
+// storeWarehouseEvent (notification-service) записывает уведомление из warehouse.events
+// и меняет ревизию данных — страницы подхватят его при следующем опросе.
+func (a *API) storeWarehouseEvent(value []byte) {
+	var event warehouseEvent
+	if err := json.Unmarshal(value, &event); err != nil || event.Text == "" {
+		log.Printf("Уведомления: непонятное событие: %v", err)
+		return
+	}
+	a.insertAlert(event)
+	a.bumpRev()
 }
 
 func (a *API) maintain() error {

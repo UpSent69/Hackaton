@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"auth-service/internal/contract"
+	"auth-service/internal/events"
 	"auth-service/internal/requestimport"
 	"context"
 	"crypto/rand"
@@ -87,13 +88,14 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	authed("POST", "/api/orders", true, a.CreateOrder, waiter)
 	authed("GET", "/api/orders", false, a.Orders, waiter)
 
-	authed("GET", "/api/alerts", false, a.Alerts)
 	authed("GET", "/api/pulse", false, a.Pulse, waiter, supplier)
 	authed("GET", "/api/hot-offers", false, a.cachedJSON("hot-offers", a.HotOffers))
 	authed("GET", "/api/analytics", false, a.cachedJSON("analytics", a.Analytics))
 	mux.Handle("GET /api/analytics/ai", a.protectLongRunning(false, a.AnalyticsInsight))
-	go requestimport.Warmup(requestimport.OllamaConfig())
-	a.startDocumentWorker()
+	// Результаты распознавания и анализа приходят из ai-service через Kafka.
+	a.Bus.Consume(events.TopicDocumentResults, "core", a.storeDocumentResult)
+	a.Bus.Consume(events.TopicAnalyticsResults, "core", a.storeInsightResult)
+	go cleanupMemoryJobs()
 
 	authed("GET", "/api/demo/state", false, a.DemoState)
 	authed("POST", "/api/demo/clock", true, a.DemoClock)
@@ -140,7 +142,7 @@ func (a *API) protect(adminOnly bool, next http.HandlerFunc, extra ...contract.R
 			a.writeError(w, http.StatusForbidden, "Недостаточно прав для выполнения операции")
 			return
 		}
-		if err := a.maintain(); err != nil {
+		if err := a.maintainIfOwner(); err != nil {
 			a.writeError(w, http.StatusInternalServerError, "Не удалось обновить состояние склада")
 			return
 		}
@@ -165,7 +167,7 @@ func (a *API) protectLongRunning(adminOnly bool, next http.HandlerFunc, extra ..
 			a.writeError(w, http.StatusForbidden, "Недостаточно прав для выполнения операции")
 			return
 		}
-		if err := a.maintain(); err != nil {
+		if err := a.maintainIfOwner(); err != nil {
 			requestMu.Unlock()
 			a.writeError(w, http.StatusInternalServerError, "Не удалось обновить состояние склада")
 			return
@@ -735,4 +737,29 @@ func (a *API) DeleteManager(w http.ResponseWriter, r *http.Request) {
 	}
 	a.bumpRev()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// maintainIfOwner — склад обслуживает только core; остальные сервисы лишь проверяют вход.
+func (a *API) maintainIfOwner() error {
+	if a.NoMaintenance {
+		return nil
+	}
+	return a.maintain()
+}
+
+// RegisterNotificationRoutes — маршруты notification-service: лента уведомлений.
+// Шлюз направляет сюда GET /api/alerts; уведомления приходят из Kafka (warehouse.events).
+func (a *API) RegisterNotificationRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
+		a.sendJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "notification"})
+	})
+	mux.Handle("GET /api/alerts", a.protect(false, a.Alerts))
+	a.Bus.Consume(events.TopicWarehouseEvents, "notification-service", a.storeWarehouseEvent)
+}
+
+// StartAIWorkers — ai-service: распознавание документов и аналитика Qwen из Kafka.
+func (a *API) StartAIWorkers() {
+	go requestimport.Warmup(requestimport.OllamaConfig())
+	a.Bus.Consume(events.TopicDocumentJobs, "ai-service", a.processDocument)
+	a.Bus.Consume(events.TopicAnalyticsRequests, "ai-service", a.processInsight)
 }

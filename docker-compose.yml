@@ -1,28 +1,106 @@
+# Микросервисы Stoplist:
+#   frontend → gateway → core / notification-service;  core ⇄ Kafka ⇄ ai-service, notification-service.
+# Все Go-сервисы собираются из одного кода (auth-service), роль задаёт SERVICE.
+# Данные — общая база SQLite (том db_data) и общий Redis.
+
+# Образ Go собирается один раз (в core); ai-service и notification-service запускают его же.
+x-api: &api
+  image: stoplist-api:local
+  volumes:
+    - db_data:/root/data
+  networks:
+    - app-network
+  restart: unless-stopped
+
+x-api-env: &api-env
+  SQLITE_DB_PATH: /root/data/app.db
+  PORT: "8080"
+  JWT_SECRET: ${JWT_SECRET:-local-development-only-change-this-secret}
+  REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+  KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+
 services:
-  backend:
+  # core — HTTP API сайта: вход, склад, поставки, меню, заказы, заявки, аналитика.
+  # Единственный сервис, который создаёт и мигрирует схему базы.
+  core:
+    <<: *api
     build:
       context: ./auth-service
       dockerfile: Dockerfile
-    container_name: hackaton-backend
+    container_name: hackaton-core
     environment:
-      SQLITE_DB_PATH: /root/data/app.db
-      PORT: "8080"
-      JWT_SECRET: ${JWT_SECRET:-local-development-only-change-this-secret}
-      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:2b}
-      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+      <<: *api-env
+      SERVICE: core
     depends_on:
       - redis
+      - kafka
+
+  # ai-service — распознавание накладных и заявок и аналитика Qwen (Ollama). Задачи берёт из Kafka.
+  ai-service:
+    <<: *api
+    pull_policy: never
+    container_name: hackaton-ai
+    environment:
+      <<: *api-env
+      SERVICE: ai
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:2b}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - core
+      - kafka
+
+  # notification-service — уведомления из событий склада (Kafka) и лента GET /api/alerts.
+  notification-service:
+    <<: *api
+    pull_policy: never
+    container_name: hackaton-notification
+    environment:
+      <<: *api-env
+      SERVICE: notification
+    depends_on:
+      - core
+      - kafka
+
+  # API-шлюз: раскидывает /api/ по сервисам (см. gateway/nginx.conf).
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: hackaton-gateway
     volumes:
-      - db_data:/root/data
+      - ./gateway/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - core
+      - notification-service
     networks:
       - app-network
     restart: unless-stopped
 
-  # Redis: сессии, кэш, ревизия данных, ограничение частоты и очередь распознавания документов.
-  # Основные данные склада остаются в SQLite; без Redis бэкенд продолжает работать.
+  # Kafka — один брокер в режиме KRaft (без Zookeeper). Лимит сообщения поднят до 32 МБ:
+  # фото накладной уходит в ai-service целиком.
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: hackaton-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_MESSAGE_MAX_BYTES: 33554432
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 33554432
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Redis: сессии, кэш, ревизия данных, ограничение частоты, результаты распознавания.
+  # Основные данные склада остаются в SQLite; без Redis сервисы продолжают работать.
   redis:
     image: redis:7.4-alpine
     container_name: hackaton-redis
@@ -55,7 +133,7 @@ services:
     ports:
       - "80:80"
     depends_on:
-      - backend
+      - gateway
     networks:
       - app-network
     restart: unless-stopped

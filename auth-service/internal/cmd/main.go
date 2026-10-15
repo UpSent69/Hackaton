@@ -2,6 +2,7 @@ package main
 
 import (
 	"auth-service/internal/database"
+	"auth-service/internal/events"
 	"auth-service/internal/handlers"
 	"log"
 	"net/http"
@@ -32,7 +33,20 @@ func main() {
 		log.Fatalf("Не удалось создать директорию для БД: %v", err)
 	}
 
-	db, err := database.Init(dbPath)
+	// Один бинарник — три микросервиса, роль задаёт SERVICE:
+	//   core         — HTTP API сайта (вход, склад, поставки, меню, заказы, заявки, аналитика);
+	//   ai           — распознавание документов и аналитика Qwen (задачи из Kafka);
+	//   notification — уведомления из событий склада (Kafka) и GET /api/alerts.
+	// Все сервисы работают с общей базой SQLite и общим Redis.
+	service := strings.TrimSpace(os.Getenv("SERVICE"))
+	if service == "" {
+		service = "core"
+	}
+	open := database.Open
+	if service == "core" {
+		open = database.Init
+	}
+	db, err := open(dbPath)
 	if err != nil {
 		log.Fatalf("Ошибка инициализации БД: %v", err)
 	}
@@ -48,15 +62,31 @@ func main() {
 	}
 	handlers.SetJWTSecret([]byte(secret))
 
-	api := &handlers.API{DB: db, KV: handlers.NewKV(os.Getenv("REDIS_ADDR"))}
+	api := &handlers.API{
+		DB: db, KV: handlers.NewKV(os.Getenv("REDIS_ADDR")), Bus: events.New(os.Getenv("KAFKA_BROKERS")),
+		NoMaintenance: service != "core",
+	}
 	mux := http.NewServeMux()
-	api.RegisterRoutes(mux)
+	switch service {
+	case "core":
+		api.RegisterRoutes(mux)
+	case "ai":
+		api.StartAIWorkers()
+		mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","service":"ai"}`))
+		})
+	case "notification":
+		api.RegisterNotificationRoutes(mux)
+	default:
+		log.Fatalf("Неизвестный SERVICE=%q: ожидается core, ai или notification", service)
+	}
 
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
 		port = "8080"
 	}
 	handler := api.RevisionMiddleware(corsMiddleware(mux))
-	log.Printf("Stoplist API запущен на порту %s", port)
+	log.Printf("Stoplist %s запущен на порту %s", service, port)
 	log.Fatal(http.ListenAndServe(":"+port, handler))
 }

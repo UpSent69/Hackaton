@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"auth-service/internal/contract"
+	"auth-service/internal/events"
 	"auth-service/internal/requestimport"
 	"context"
 	"encoding/json"
@@ -31,9 +32,11 @@ type analyticsInsightResponse struct {
 // Анализ модели живёт до следующего изменения данных: автообновление страницы
 // не должно каждый раз запускать нейросеть.
 //
-// Сам анализ идёт в фоне: после перерыва Ollama сначала загружает модель в память, и ответ
-// может прийти позже, чем nginx держит запрос (60 с). Поэтому маршрут сразу отвечает 202
-// «считается», а страница переспрашивает с ?poll=1, пока не получит результат.
+// Сам анализ идёт в ai-service: core собирает статистику и публикует её в Kafka
+// (analytics.requests), ai-service спрашивает Qwen и публикует ответ (analytics.results).
+// После перерыва Ollama сначала загружает модель в память, и ответ может прийти позже, чем
+// nginx держит запрос (60 с). Поэтому маршрут сразу отвечает 202 «считается», а страница
+// переспрашивает с ?poll=1, пока не получит результат.
 //
 // Результат, признак «считается» и последняя ошибка хранятся в Redis (переживают перезапуск
 // сервера, признак «считается» снимается сам через insightTimeout); без Redis — в памяти.
@@ -41,9 +44,24 @@ var (
 	insightMu      sync.Mutex
 	insightRev     int64 = -1
 	insightCache   analyticsInsightResponse
-	insightRunning bool
+	insightStarted time.Time // когда запущен анализ (запасной признак «считается» без Redis)
 	insightErr     string
 )
+
+// insightRequest — статистика для анализа (core → ai-service).
+type insightRequest struct {
+	Rev       int64     `json:"rev"`
+	Facts     string    `json:"facts"`
+	MenuNames []string  `json:"menuNames"`
+	Now       time.Time `json:"now"`
+}
+
+// insightResult — готовый анализ или понятная ошибка (ai-service → core).
+type insightResult struct {
+	Rev    int64                     `json:"rev"`
+	Result *analyticsInsightResponse `json:"result,omitempty"`
+	Error  string                    `json:"error,omitempty"`
+}
 
 const insightTimeout = 3 * time.Minute
 
@@ -73,7 +91,7 @@ func (a *API) insightIsRunning() bool {
 	if _, ok := a.KV.Get("insight:running"); ok {
 		return true
 	}
-	return insightRunning
+	return !insightStarted.IsZero() && time.Since(insightStarted) < insightTimeout+30*time.Second
 }
 
 func (a *API) insightError() string {
@@ -156,37 +174,66 @@ func (a *API) AnalyticsInsight(w http.ResponseWriter, r *http.Request) {
 		a.sendJSON(w, http.StatusAccepted, pending)
 		return
 	}
-	insightRunning = true
+	request := insightRequest{Rev: rev, Facts: facts, MenuNames: menuNames, Now: now}
+	if err := a.Bus.Publish(context.Background(), events.TopicAnalyticsRequests, strconv.FormatInt(rev, 10), request); err != nil {
+		log.Printf("Аналитика Qwen: Kafka недоступна: %v", err)
+		a.KV.Del("insight:running")
+		a.writeError(w, http.StatusServiceUnavailable, "Сервис аналитики временно недоступен, попробуйте через минуту")
+		return
+	}
+	insightStarted = time.Now()
 	a.setInsightError("")
-	go a.generateInsight(rev, facts, menuNames, now)
 	a.sendJSON(w, http.StatusAccepted, pending)
 }
 
-func (a *API) generateInsight(rev int64, facts string, menuNames []string, now time.Time) {
+// processInsight (ai-service) спрашивает Qwen по статистике из analytics.requests
+// и публикует ответ в analytics.results.
+func (a *API) processInsight(value []byte) {
+	var request insightRequest
+	if err := json.Unmarshal(value, &request); err != nil {
+		log.Printf("Аналитика Qwen: непонятный запрос: %v", err)
+		return
+	}
 	baseURL, model := requestimport.OllamaConfig()
 	ctx, cancel := context.WithTimeout(context.Background(), insightTimeout)
 	defer cancel()
 	started := time.Now()
-	insight, err := requestimport.AnalyzeStats(ctx, facts, baseURL, model)
+	insight, err := requestimport.AnalyzeStats(ctx, request.Facts, baseURL, model)
 	log.Printf("Аналитика Qwen: время=%s, ошибка=%v", time.Since(started), err)
 
-	insightMu.Lock()
-	defer insightMu.Unlock()
-	defer func() {
-		insightRunning = false
-		a.KV.Del("insight:running")
-	}()
+	result := insightResult{Rev: request.Rev}
 	if err != nil {
-		a.setInsightError(friendlyOllamaError(err, model))
+		result.Error = friendlyOllamaError(err, model)
+	} else {
+		menuPicks := onlyMenuDishes(insight.MenuPicks, request.MenuNames)
+		log.Printf("Аналитика Qwen: блюд из меню предложено %d, совпало с меню %d", len(insight.MenuPicks), len(menuPicks))
+		result.Result = &analyticsInsightResponse{
+			Summary: insight.Summary, Risks: insight.Risks, Actions: insight.Actions,
+			Season: insight.Season, MenuPicks: menuPicks, NewDishes: insight.NewDishes,
+			Model: model, GeneratedAt: request.Now,
+		}
+	}
+	if err := a.Bus.Publish(context.Background(), events.TopicAnalyticsResults, strconv.FormatInt(request.Rev, 10), result); err != nil {
+		log.Printf("Аналитика Qwen: не удалось отправить ответ: %v", err)
+	}
+}
+
+// storeInsightResult (core) сохраняет ответ из analytics.results и снимает признак «считается».
+func (a *API) storeInsightResult(value []byte) {
+	var result insightResult
+	if err := json.Unmarshal(value, &result); err != nil {
+		log.Printf("Аналитика Qwen: непонятный ответ: %v", err)
 		return
 	}
-	menuPicks := onlyMenuDishes(insight.MenuPicks, menuNames)
-	log.Printf("Аналитика Qwen: блюд из меню предложено %d, совпало с меню %d", len(insight.MenuPicks), len(menuPicks))
-	a.saveInsight(rev, analyticsInsightResponse{
-		Summary: insight.Summary, Risks: insight.Risks, Actions: insight.Actions,
-		Season: insight.Season, MenuPicks: menuPicks, NewDishes: insight.NewDishes,
-		Model: model, GeneratedAt: now,
-	})
+	insightMu.Lock()
+	defer insightMu.Unlock()
+	insightStarted = time.Time{}
+	a.KV.Del("insight:running")
+	if result.Result == nil {
+		a.setInsightError(result.Error)
+		return
+	}
+	a.saveInsight(result.Rev, *result.Result)
 }
 
 // friendlyOllamaError объясняет частые причины на компьютере, где Ollama настроена иначе.
